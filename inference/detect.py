@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-detect.py v3 — Inferência em tempo real.
+detect.py v4 — Inferência em tempo real.
 
-Mudanças v3:
-  • SEM conversão para escala de cinza (modelo treinado em RGB original)
-  • SEM aplicação de configuração de exposição (câmera no padrão do sistema)
-  • Octógono de inferência opcional, definido via utils/roi_inference.py
+Abordagem v4:
+  • A ROI é o OCTÓGONO do tray, definido em utils/roi_inference.py
+  • O mesmo octógono é usado na coleta (auto_collect.py) e na inferência
+  • Ambos aplicam octagon_to_square(): recorta para a bbox do octógono,
+    mascara (preto) os pixels fora dele, e centraliza num canvas quadrado
+  • SEM tiling, SEM collect_roi separado — uma única transformação
+    consistente entre treino e inferência
 
 Uso:
     python inference/detect.py                        # webcam
     python inference/detect.py --source foto.jpg       # imagem
     python inference/detect.py --weights caminho/best.pt
-    python inference/detect.py --no-roi                # ignora octógono salvo
+    python inference/detect.py --no-roi                # ignora octógono, frame inteiro
 
 Controles:
     ESPAÇO → congelar frame e exibir resultado
@@ -41,10 +44,7 @@ except ImportError:
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from inference.result_reader import interpret_detections, RollResult
-from utils.roi_inference import (
-    load_inference_roi, crop_to_polygon_bbox, apply_polygon_mask
-)
-from utils.roi_collect import load_collect_roi, crop_to_roi as crop_to_collect_roi
+from utils.roi_inference import load_inference_roi, crop_to_polygon_bbox
 
 DICE_COLORS_BGR = {
     "d6":  (80,  200, 80),
@@ -57,27 +57,46 @@ DICE_COLORS_BGR = {
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-# ─── ROI helpers ───────────────────────────────────────────────────────────────
+# ─── ROI: octógono → canvas quadrado mascarado ─────────────────────────────────
 
-def apply_roi(frame, collect_roi):
+def octagon_to_square(img: np.ndarray, polygon: list):
     """
-    Recorta o frame para o MESMO retângulo (collect_roi) usado na coleta do
-    dataset — garante que o dado tenha, na inferência, a mesma proporção de
-    pixels que teve durante o treino.
-    Retorna (crop, off_x, off_y) para reposicionar bboxes no frame original.
+    Recorta para a bbox do octógono, mascara (preto) fora dele, e centraliza
+    num canvas quadrado (lado = maior dimensão da bbox).
+
+    Retorna (canvas, off_x, off_y, pad_x, pad_y) onde:
+      off_x, off_y = posição da bbox do octógono no frame original
+      pad_x, pad_y = padding aplicado para centralizar no canvas quadrado
+
+    Para converter coordenadas do canvas de volta ao frame original:
+      x_original = x_canvas - pad_x + off_x
+      y_original = y_canvas - pad_y + off_y
     """
-    if collect_roi is None:
-        return frame, 0, 0
-    crop = crop_to_collect_roi(frame, collect_roi)
-    off_x, off_y = collect_roi[0], collect_roi[1]
-    return crop, off_x, off_y
+    if not polygon:
+        h, w = img.shape[:2]
+        return img, 0, 0, 0, 0
+
+    masked, x, y = crop_to_polygon_bbox(img, polygon)
+    h, w = masked.shape[:2]
+    side = max(h, w)
+
+    canvas = np.full((side, side, 3), 255, dtype=masked.dtype)
+    pad_x = (side - w) // 2
+    pad_y = (side - h) // 2
+    canvas[pad_y:pad_y+h, pad_x:pad_x+w] = masked
+    return canvas, x, y, pad_x, pad_y
 
 
 def draw_roi_overlay(frame, polygon):
-    if polygon is None:
+    """Escurece área fora do octógono e desenha a borda — apenas visual."""
+    if not polygon:
         return frame
-    out, _ = apply_polygon_mask(frame, polygon, darken_outside=True)
-    pts = np.array(polygon, dtype=np.int32)
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    pts  = np.array(polygon, dtype=np.int32)
+    cv2.fillPoly(mask, [pts], 255)
+    dark = (frame * 0.35).astype(np.uint8)
+    out  = np.where(np.stack([mask]*3, axis=2) > 0, frame, dark)
     cv2.polylines(out, [pts], isClosed=True, color=(0, 220, 80), thickness=2)
     return out
 
@@ -132,17 +151,18 @@ def draw_hud_top(frame, frozen=False, roi_active=False):
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 32), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    msg = "RPG Dice CV v3  |  ESPACO=congelar  S=salvar  Q=sair"
+    msg = "RPG Dice CV v4  |  ESPACO=congelar  S=salvar  Q=sair"
     cv2.putText(frame, msg, (8, 21), FONT, 0.44, (180,180,180), 1)
     if frozen:
         cv2.putText(frame, "[ CONGELADO ]", (w-175, 21), FONT, 0.55, (0,200,255), 2)
     if not roi_active:
-        cv2.putText(frame, "[ sem octogono — frame inteiro ]",
-                    (w-300, h-1) if False else (8, 50),
+        cv2.putText(frame, "[ sem octogono — frame inteiro ]", (8, 50),
                     FONT, 0.4, (180,150,80), 1)
 
 
-def yolo_to_detections(yolo_results, class_names, offset_x=0, offset_y=0):
+def yolo_to_detections(yolo_results, class_names, off_x=0, off_y=0,
+                       pad_x=0, pad_y=0):
+    """Converte detecções do canvas quadrado de volta para coordenadas do frame original."""
     detections = []
     for result in yolo_results:
         if result.boxes is None:
@@ -150,9 +170,11 @@ def yolo_to_detections(yolo_results, class_names, offset_x=0, offset_y=0):
         for box in result.boxes:
             cid  = int(box.cls[0])
             conf = float(box.conf[0])
-            x1,y1,x2,y2 = box.xyxy[0].tolist()
-            x1 += offset_x; x2 += offset_x
-            y1 += offset_y; y2 += offset_y
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            x1 = x1 - pad_x + off_x
+            x2 = x2 - pad_x + off_x
+            y1 = y1 - pad_y + off_y
+            y2 = y2 - pad_y + off_y
             cls_name = class_names.get(cid, "unknown")
             detections.append((cls_name, conf, (x1, y1, x2, y2)))
     return detections
@@ -183,21 +205,12 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
     screenshots_dir = PROJECT_ROOT / "screenshots"
     screenshots_dir.mkdir(exist_ok=True)
 
-    collect_roi = load_collect_roi()
-    octagon     = load_inference_roi() if use_roi else None
-
-    if collect_roi:
-        print(f"[INFO] Crop de inferência = collect_roi {collect_roi} "
-              f"(mesma proporção do treino)")
-    else:
-        print("[INFO] Sem collect_roi salvo — usando frame inteiro "
-              "(pode reduzir a precisão).")
-
+    octagon = load_inference_roi() if use_roi else None
     if octagon:
-        print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos) "
-              f"— usado apenas para destacar visualmente a área.")
+        print(f"[INFO] Octógono do tray ativo ({len(octagon)} pontos)")
     else:
-        print("[INFO] Sem octógono — sem destaque visual de área.")
+        print("[INFO] Sem octógono — processando frame inteiro.")
+        print("       Para definir: python utils/roi_inference.py")
 
     cv2.namedWindow("RPG Dice Detector", cv2.WINDOW_NORMAL)
     frozen = False; frozen_frame = None; frozen_roll = None
@@ -223,13 +236,13 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
                 fps = 0.9*fps + 0.1*(1.0/max(now-prev_time, 1e-5))
                 prev_time = now
 
-                # Recortar para o collect_roi — mesma proporção do treino
-                crop, off_x, off_y = apply_roi(frame, collect_roi)
+                canvas, off_x, off_y, pad_x, pad_y = octagon_to_square(frame, octagon)
 
-                results    = model.predict(crop, conf=conf_thr, verbose=False,
+                results    = model.predict(canvas, conf=conf_thr, verbose=False,
                                            imgsz=640,
                                            iou=cfg.get("iou_threshold", 0.45))
-                detections = yolo_to_detections(results, class_names, off_x, off_y)
+                detections = yolo_to_detections(results, class_names,
+                                                off_x, off_y, pad_x, pad_y)
                 roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
                 display = draw_roi_overlay(frame.copy(), octagon)
@@ -275,21 +288,18 @@ def run_image(model, class_names, cfg, source, use_roi=True):
     out_dir = PROJECT_ROOT / "inference_results"
     out_dir.mkdir(exist_ok=True)
 
-    collect_roi = load_collect_roi()
-    octagon     = load_inference_roi() if use_roi else None
-    if collect_roi:
-        print(f"[INFO] Crop de inferência = collect_roi {collect_roi}")
+    octagon = load_inference_roi() if use_roi else None
     if octagon:
-        print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos)")
+        print(f"[INFO] Octógono do tray ativo ({len(octagon)} pontos)")
 
     for img_path in images:
         frame = cv2.imread(str(img_path))
         if frame is None:
             continue
 
-        crop, off_x, off_y = apply_roi(frame, collect_roi)
-        results    = model.predict(crop, conf=conf_thr, verbose=False)
-        detections = yolo_to_detections(results, class_names, off_x, off_y)
+        canvas, off_x, off_y, pad_x, pad_y = octagon_to_square(frame, octagon)
+        results    = model.predict(canvas, conf=conf_thr, verbose=False)
+        detections = yolo_to_detections(results, class_names, off_x, off_y, pad_x, pad_y)
         roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
         display = draw_roi_overlay(frame.copy(), octagon)

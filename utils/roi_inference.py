@@ -185,7 +185,7 @@ def apply_polygon_mask(frame, polygon, darken_outside=True):
     return result, (x, y, bw, bh)
 
 
-def crop_to_polygon_bbox(frame, polygon):
+def crop_to_polygon_bbox(frame, polygon, fill_color=(255, 255, 255)):
     if not polygon:
         return frame, 0, 0
     h, w = frame.shape[:2]
@@ -197,7 +197,7 @@ def crop_to_polygon_bbox(frame, polygon):
     local_poly = pts - np.array([x, y])
     mask = np.zeros((bh, bw), dtype=np.uint8)
     cv2.fillPoly(mask, [local_poly], 255)
-    crop[mask == 0] = 0
+    crop[mask == 0] = fill_color
     return crop, x, y
 
 

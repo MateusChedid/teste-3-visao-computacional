@@ -41,7 +41,12 @@ INPUT_DIR    = PROJECT_ROOT / "dataset_collector" / "input"
 WORK_DIR     = PROJECT_ROOT / "dataset_collector" / "_work"
 
 sys.path.insert(0, str(PROJECT_ROOT))
-from utils.roi_collect import load_collect_roi, run_selector, save_collect_roi, crop_to_roi
+from utils.roi_inference import (
+    run_selector as run_octagon_selector,
+    save_inference_roi as save_octagon,
+    load_inference_roi as load_octagon,
+    crop_to_polygon_bbox,
+)
 
 N_ROTATIONS  = 80                       # rotações por foto
 ROTATION_STEP_DEG = 360.0 / N_ROTATIONS  # = 4.5°
@@ -116,7 +121,8 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
         rotated_full = cv2.warpAffine(
             img, M, (w, h),
             flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REPLICATE,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
         )
         # Recorte central seguro — só pixels reais, sem replicação
         rotated = rotated_full[cy-half_safe:cy+half_safe, cx-half_safe:cx+half_safe]
@@ -209,6 +215,27 @@ def copy_to_split(img_path: Path, lbl_path: Path, split: str):
         dst = DATASET_ROOT / subdir / split / src.name
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
+
+
+def octagon_to_square(img: np.ndarray, polygon: list) -> np.ndarray:
+    """
+    Recorta a imagem para a bounding box do octógono, mascara pixels fora
+    dele (preto), e depois centraliza esse recorte num CANVAS QUADRADO
+    (lado = maior dimensão da bbox), preenchendo a sobra com preto.
+
+    Essa máscara/canvas é o que tanto o auto_collect (treino) quanto o
+    detect.py (inferência) vão produzir a partir do octógono — garantindo
+    consistência total de escala e formato.
+    """
+    masked, x, y = crop_to_polygon_bbox(img, polygon)
+    h, w = masked.shape[:2]
+    side = max(h, w)
+
+    canvas = np.full((side, side, 3), 255, dtype=masked.dtype)
+    off_y = (side - h) // 2
+    off_x = (side - w) // 2
+    canvas[off_y:off_y+h, off_x:off_x+w] = masked
+    return canvas
 
 
 # ─── Seleção manual de bbox (para fallbacks) ──────────────────────────────────
@@ -366,7 +393,7 @@ def run_pipeline(images: list, class_map: dict, model, roi):
         if img is None:
             print(f"    [ERRO] não foi possível ler {img_path.name}")
             continue
-        cropped = crop_to_roi(img, roi)
+        cropped = octagon_to_square(img, roi) if roi else img
 
         tmp_path = WORK_DIR / "cropped" / f"{stem}.jpg"
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -536,23 +563,24 @@ def main():
 
     class_map = load_class_map()
 
-    # ── ROI quadrada de coleta ────────────────────────────────────────────────
-    roi = None if args.clear_roi else load_collect_roi()
+    # ── Octógono de coleta (contorno do tray) ─────────────────────────────────
+    roi = None if args.clear_roi else load_octagon()
 
     if roi:
-        print(f"\n[INFO] ROI de coleta carregada: {roi}")
+        print(f"\n[INFO] Octógono do tray carregado ({len(roi)} pontos)")
         if not args.skip_roi:
-            ans = input("  Usar esta ROI? [S/n]: ").strip().lower()
+            ans = input("  Usar este octógono? [S/n]: ").strip().lower()
             if ans == "n":
                 roi = None
 
     if roi is None and not args.skip_roi:
-        print("\n[INFO] Selecione a área quadrada do tray.")
-        roi = run_selector(args.camera)
-        if roi:
-            save_collect_roi(roi)
+        print("\n[INFO] Selecione o contorno (octógono) do tray.")
+        roi = run_octagon_selector(args.camera)
+        if roi and len(roi) >= 3:
+            save_octagon(roi)
         else:
-            print("  [i] Sem ROI — usando frame inteiro (não recomendado).")
+            roi = None
+            print("  [i] Sem octógono — usando frame inteiro (não recomendado).")
 
     # ── Modelo de detecção automática ─────────────────────────────────────────
     print("\n[INFO] Carregando modelo de detecção automática...")
