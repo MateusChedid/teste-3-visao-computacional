@@ -168,6 +168,16 @@ def render(frame, roi: SquareROI, confirmed=False):
     color = (0, 220, 80) if confirmed else (0, 180, 255)
     cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
 
+    # Guia da "zona segura" pós-rotação (~71% do quadrado, centralizado)
+    # — o dado deve ficar dentro desta área interna mesmo após girar
+    safe_size = int(roi.size / 1.41421356)
+    cx, cy = (x1 + x2)//2, (y1 + y2)//2
+    sx1, sy1 = cx - safe_size//2, cy - safe_size//2
+    sx2, sy2 = cx + safe_size//2, cy + safe_size//2
+    cv2.rectangle(display, (sx1, sy1), (sx2, sy2), (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.putText(display, "zona segura (pos-rotacao)", (sx1, sy1 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1)
+
     # Desenhar alças nos 4 cantos
     for (cx, cy) in [(x1,y1),(x2,y1),(x1,y2),(x2,y2)]:
         cv2.circle(display, (cx, cy), 6, color, -1)
@@ -224,6 +234,8 @@ def run_selector(camera_index: int = 0):
     print("="*58)
     print("  Arraste o quadrado para a área do tray.")
     print("  Use os cantos para redimensionar (mantém quadrado).")
+    print("  A linha pontilhada interna é a 'zona segura' pós-rotação:")
+    print("  o DADO deve caber dentro dela mesmo girado 360°.")
     print("  ENTER = confirmar   R = resetar   Q = sair\n")
 
     result = None
