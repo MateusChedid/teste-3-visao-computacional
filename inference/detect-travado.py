@@ -73,6 +73,71 @@ def apply_roi(frame, collect_roi):
     return crop, off_x, off_y
 
 
+# Sobreposição entre janelas adjacentes — evita perder dados na borda
+TILE_OVERLAP_FRAC = 0.35
+
+
+def generate_tiles(frame, collect_roi, scan_area):
+    """
+    Gera janelas de recorte do MESMO TAMANHO do collect_roi, cobrindo toda
+    a scan_area (bounding box do octógono ou frame inteiro), com overlap.
+
+    Retorna lista de (crop, off_x, off_y).
+    """
+    h, w = frame.shape[:2]
+
+    if collect_roi is None:
+        return [(frame, 0, 0)]
+
+    tile_w = collect_roi[2] - collect_roi[0]
+    tile_h = collect_roi[3] - collect_roi[1]
+
+    if scan_area is None:
+        sx1, sy1, sx2, sy2 = 0, 0, w, h
+    else:
+        sx1, sy1, sx2, sy2 = scan_area
+
+    sx1 = max(0, sx1); sy1 = max(0, sy1)
+    sx2 = min(w, sx2); sy2 = min(h, sy2)
+
+    step_x = max(1, int(tile_w * (1 - TILE_OVERLAP_FRAC)))
+    step_y = max(1, int(tile_h * (1 - TILE_OVERLAP_FRAC)))
+
+    tiles = []
+    y = sy1
+    while True:
+        y_end = min(y + tile_h, sy2)
+        y_start = max(sy1, y_end - tile_h)
+
+        x = sx1
+        while True:
+            x_end = min(x + tile_w, sx2)
+            x_start = max(sx1, x_end - tile_w)
+
+            crop = frame[y_start:y_end, x_start:x_end]
+            if crop.shape[0] > 10 and crop.shape[1] > 10:
+                tiles.append((crop, x_start, y_start))
+
+            if x_end >= sx2:
+                break
+            x += step_x
+
+        if y_end >= sy2:
+            break
+        y += step_y
+
+    return tiles
+
+
+def octagon_bbox(polygon):
+    """Bounding box (x1,y1,x2,y2) do octógono, ou None."""
+    if not polygon:
+        return None
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def draw_roi_overlay(frame, polygon):
     if polygon is None:
         return frame
@@ -195,9 +260,18 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
 
     if octagon:
         print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos) "
-              f"— usado apenas para destacar visualmente a área.")
+              f"— define a área de varredura.")
     else:
-        print("[INFO] Sem octógono — sem destaque visual de área.")
+        print("[INFO] Sem octógono — varredura no frame inteiro.")
+
+    scan_area = octagon_bbox(octagon)
+
+    if collect_roi:
+        _sample = generate_tiles(
+            np.zeros((720, 1280, 3), dtype=np.uint8), collect_roi, scan_area
+        )
+        print(f"[INFO] {len(_sample)} janela(s) por frame "
+              f"(overlap {TILE_OVERLAP_FRAC:.0%})")
 
     cv2.namedWindow("RPG Dice Detector", cv2.WINDOW_NORMAL)
     frozen = False; frozen_frame = None; frozen_roll = None
@@ -223,14 +297,19 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
                 fps = 0.9*fps + 0.1*(1.0/max(now-prev_time, 1e-5))
                 prev_time = now
 
-                # Recortar para o collect_roi — mesma proporção do treino
-                crop, off_x, off_y = apply_roi(frame, collect_roi)
+                # Gerar janelas do tamanho do collect_roi cobrindo a área
+                tiles = generate_tiles(frame, collect_roi, scan_area)
 
-                results    = model.predict(crop, conf=conf_thr, verbose=False,
-                                           imgsz=640,
-                                           iou=cfg.get("iou_threshold", 0.45))
-                detections = yolo_to_detections(results, class_names, off_x, off_y)
-                roll       = interpret_detections(detections, conf_threshold=conf_thr)
+                all_detections = []
+                for crop, off_x, off_y in tiles:
+                    results = model.predict(crop, conf=conf_thr, verbose=False,
+                                            imgsz=640,
+                                            iou=cfg.get("iou_threshold", 0.45))
+                    all_detections.extend(
+                        yolo_to_detections(results, class_names, off_x, off_y)
+                    )
+
+                roll = interpret_detections(all_detections, conf_threshold=conf_thr)
 
                 display = draw_roi_overlay(frame.copy(), octagon)
                 display = render_frame(display, roll, fps=fps, roi_active=bool(octagon))
@@ -282,15 +361,21 @@ def run_image(model, class_names, cfg, source, use_roi=True):
     if octagon:
         print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos)")
 
+    scan_area = octagon_bbox(octagon)
+
     for img_path in images:
         frame = cv2.imread(str(img_path))
         if frame is None:
             continue
 
-        crop, off_x, off_y = apply_roi(frame, collect_roi)
-        results    = model.predict(crop, conf=conf_thr, verbose=False)
-        detections = yolo_to_detections(results, class_names, off_x, off_y)
-        roll       = interpret_detections(detections, conf_threshold=conf_thr)
+        tiles = generate_tiles(frame, collect_roi, scan_area)
+        all_detections = []
+        for crop, off_x, off_y in tiles:
+            results = model.predict(crop, conf=conf_thr, verbose=False)
+            all_detections.extend(
+                yolo_to_detections(results, class_names, off_x, off_y)
+            )
+        roll = interpret_detections(all_detections, conf_threshold=conf_thr)
 
         display = draw_roi_overlay(frame.copy(), octagon)
         display = render_frame(display, roll, roi_active=bool(octagon))

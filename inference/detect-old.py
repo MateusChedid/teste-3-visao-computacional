@@ -44,7 +44,6 @@ from inference.result_reader import interpret_detections, RollResult
 from utils.roi_inference import (
     load_inference_roi, crop_to_polygon_bbox, apply_polygon_mask
 )
-from utils.roi_collect import load_collect_roi, crop_to_roi as crop_to_collect_roi
 
 DICE_COLORS_BGR = {
     "d6":  (80,  200, 80),
@@ -59,18 +58,11 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # ─── ROI helpers ───────────────────────────────────────────────────────────────
 
-def apply_roi(frame, collect_roi):
-    """
-    Recorta o frame para o MESMO retângulo (collect_roi) usado na coleta do
-    dataset — garante que o dado tenha, na inferência, a mesma proporção de
-    pixels que teve durante o treino.
-    Retorna (crop, off_x, off_y) para reposicionar bboxes no frame original.
-    """
-    if collect_roi is None:
+def apply_roi(frame, polygon):
+    """Recorta frame para bbox do octógono. Retorna (crop, off_x, off_y)."""
+    if polygon is None:
         return frame, 0, 0
-    crop = crop_to_collect_roi(frame, collect_roi)
-    off_x, off_y = collect_roi[0], collect_roi[1]
-    return crop, off_x, off_y
+    return crop_to_polygon_bbox(frame, polygon)
 
 
 def draw_roi_overlay(frame, polygon):
@@ -183,21 +175,12 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
     screenshots_dir = PROJECT_ROOT / "screenshots"
     screenshots_dir.mkdir(exist_ok=True)
 
-    collect_roi = load_collect_roi()
-    octagon     = load_inference_roi() if use_roi else None
-
-    if collect_roi:
-        print(f"[INFO] Crop de inferência = collect_roi {collect_roi} "
-              f"(mesma proporção do treino)")
+    roi = load_inference_roi() if use_roi else None
+    if roi:
+        print(f"[INFO] Octógono de inferência ativo ({len(roi)} pontos)")
     else:
-        print("[INFO] Sem collect_roi salvo — usando frame inteiro "
-              "(pode reduzir a precisão).")
-
-    if octagon:
-        print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos) "
-              f"— usado apenas para destacar visualmente a área.")
-    else:
-        print("[INFO] Sem octógono — sem destaque visual de área.")
+        print("[INFO] Sem octógono — processando frame inteiro.")
+        print("       Para definir: python utils/roi_inference.py")
 
     cv2.namedWindow("RPG Dice Detector", cv2.WINDOW_NORMAL)
     frozen = False; frozen_frame = None; frozen_roll = None
@@ -205,63 +188,49 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
 
     print("[OK] Câmera aberta. Aponte para os dados e pressione ESPAÇO.\n")
 
-    frame_count = 0
-    try:
-        while True:
+    while True:
+        if not frozen:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            now = time.time()
+            fps = 0.9*fps + 0.1*(1.0/max(now-prev_time, 1e-5))
+            prev_time = now
+
+            # Recortar para o octógono (se definido) — sem alterar cor/exposição
+            crop, off_x, off_y = apply_roi(frame, roi)
+
+            results    = model.predict(crop, conf=conf_thr, verbose=False,
+                                       iou=cfg.get("iou_threshold", 0.45))
+            detections = yolo_to_detections(results, class_names, off_x, off_y)
+            roll       = interpret_detections(detections, conf_threshold=conf_thr)
+
+            display = draw_roi_overlay(frame.copy(), roi)
+            display = render_frame(display, roll, fps=fps, roi_active=bool(roi))
+        else:
+            display = render_frame(frozen_frame, frozen_roll, frozen=True, roi_active=bool(roi))
+
+        cv2.imshow("RPG Dice Detector", display)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord(" "):
             if not frozen:
-                ret, frame = cap.read()
-                if not ret:
-                    frame_count += 1
-                    if frame_count > 100:
-                        print("[ERRO] 100 frames seguidos falharam — "
-                              "a câmera pode ter sido desconectada ou está "
-                              "sendo usada por outro programa.")
-                        break
-                    continue
-                frame_count = 0
-                now = time.time()
-                fps = 0.9*fps + 0.1*(1.0/max(now-prev_time, 1e-5))
-                prev_time = now
-
-                # Recortar para o collect_roi — mesma proporção do treino
-                crop, off_x, off_y = apply_roi(frame, collect_roi)
-
-                results    = model.predict(crop, conf=conf_thr, verbose=False,
-                                           imgsz=640,
-                                           iou=cfg.get("iou_threshold", 0.45))
-                detections = yolo_to_detections(results, class_names, off_x, off_y)
-                roll       = interpret_detections(detections, conf_threshold=conf_thr)
-
-                display = draw_roi_overlay(frame.copy(), octagon)
-                display = render_frame(display, roll, fps=fps, roi_active=bool(octagon))
+                frozen = True; frozen_frame = frame.copy(); frozen_roll = roll
+                print(f"\n[RESULTADO] {roll.summary()}")
             else:
-                display = render_frame(frozen_frame, frozen_roll, frozen=True, roi_active=bool(octagon))
-
-            cv2.imshow("RPG Dice Detector", display)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
-                break
-            elif key == ord(" "):
-                if not frozen:
-                    frozen = True; frozen_frame = frame.copy(); frozen_roll = roll
-                    print(f"\n[RESULTADO] {roll.summary()}")
-                else:
-                    frozen = False
-            elif key == ord("r"):
                 frozen = False
-            elif key == ord("s"):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = screenshots_dir / f"result_{ts}.jpg"
-                cv2.imwrite(str(path), display)
-                print(f"[✓] Screenshot: {path}")
-    except Exception as e:
-        import traceback
-        print(f"\n[ERRO] Loop interrompido por exceção: {e}")
-        traceback.print_exc()
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+        elif key == ord("r"):
+            frozen = False
+        elif key == ord("s"):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = screenshots_dir / f"result_{ts}.jpg"
+            cv2.imwrite(str(path), display)
+            print(f"[✓] Screenshot: {path}")
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 # ─── Imagem estática ───────────────────────────────────────────────────────────
@@ -275,25 +244,22 @@ def run_image(model, class_names, cfg, source, use_roi=True):
     out_dir = PROJECT_ROOT / "inference_results"
     out_dir.mkdir(exist_ok=True)
 
-    collect_roi = load_collect_roi()
-    octagon     = load_inference_roi() if use_roi else None
-    if collect_roi:
-        print(f"[INFO] Crop de inferência = collect_roi {collect_roi}")
-    if octagon:
-        print(f"[INFO] Octógono de inferência ativo ({len(octagon)} pontos)")
+    roi = load_inference_roi() if use_roi else None
+    if roi:
+        print(f"[INFO] Octógono de inferência ativo ({len(roi)} pontos)")
 
     for img_path in images:
         frame = cv2.imread(str(img_path))
         if frame is None:
             continue
 
-        crop, off_x, off_y = apply_roi(frame, collect_roi)
+        crop, off_x, off_y = apply_roi(frame, roi)
         results    = model.predict(crop, conf=conf_thr, verbose=False)
         detections = yolo_to_detections(results, class_names, off_x, off_y)
         roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
-        display = draw_roi_overlay(frame.copy(), octagon)
-        display = render_frame(display, roll, roi_active=bool(octagon))
+        display = draw_roi_overlay(frame.copy(), roi)
+        display = render_frame(display, roll, roi_active=bool(roi))
         cv2.imwrite(str(out_dir / img_path.name), display)
         print(f"  {img_path.name} → {roll.summary()}")
 
