@@ -1,0 +1,48 @@
+# config.yaml — Hiperparâmetros de treino YOLOv8
+# RPG Dice CV v2 — d6, d8, d10, d12, d20
+
+model:   yolov8m.pt   # yolov8n/s/m/l/x
+epochs:  150
+patience: 25
+batch:   8            # reduza para 4 se der CUDA OOM
+imgsz:   640
+workers: 0            # 0 evita WinError 1455 no Windows
+device:  ""           # "" = auto (GPU se disponível)
+
+optimizer:    AdamW
+lr0:          0.001
+lrf:          0.01
+momentum:     0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+
+# Augmentation online
+hsv_h:      0.015
+hsv_s:      0.5
+hsv_v:      0.3
+degrees:    180.0     # rotação completa — dados caem em qualquer ângulo
+translate:  0.1
+scale:      0.3
+shear:      5.0
+flipud:     0.3
+fliplr:     0.5
+mosaic:     0.8
+mixup:      0.1
+copy_paste: 0.1
+
+# Loss weights
+box: 7.5
+cls: 0.5
+dfl: 1.5
+
+save:        true
+save_period: 10
+plots:       true
+verbose:     true
+val:         true
+
+# Inferência
+conf_threshold: 0.45
+iou_threshold:  0.45
+max_det:        20

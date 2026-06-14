@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+venv/
+.venv/
+
+runs/
+
+*.pt
+
+# Pesos YOLO baixados da Ultralytics
+yolov8*.pt
+
+# Checkpoints intermediários
+runs/**/weights/epoch*.pt
+
+.vscode/
