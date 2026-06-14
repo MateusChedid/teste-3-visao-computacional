@@ -6,7 +6,11 @@ venv/
 
 runs/
 
+# Ignora todos os pesos
 *.pt
+
+# Exceto o modelo final
+!best.pt
 
 # Pesos YOLO baixados da Ultralytics
 yolov8*.pt
