@@ -201,6 +201,67 @@ def crop_to_polygon_bbox(frame, polygon, fill_color=(255, 255, 255)):
     return crop, x, y
 
 
+def sample_paper_color(frame, polygon, border_px=15):
+    """
+    Amostra a cor real do papel/fundo do tray, usando os pixels que ficam
+    DENTRO do octógono mas próximos da sua borda (uma faixa de border_px).
+    Retorna (B, G, R) — mediana dos pixels amostrados.
+    """
+    h, w = frame.shape[:2]
+    pts = np.array(polygon, dtype=np.int32)
+
+    mask_full = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask_full, [pts], 255)
+
+    # Erodir a máscara para obter só o "miolo perto da borda interna"
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(mask_full, kernel, iterations=border_px)
+    ring = cv2.subtract(mask_full, eroded)
+
+    ys, xs = np.where(ring > 0)
+    if len(xs) == 0:
+        # fallback: usar toda a área do octógono
+        ys, xs = np.where(mask_full > 0)
+    if len(xs) == 0:
+        return (255, 255, 255)
+
+    samples = frame[ys, xs]
+    median_color = np.median(samples, axis=0)
+    return tuple(int(v) for v in median_color)
+
+
+def crop_to_polygon_bbox_paper(frame, polygon):
+    """
+    Recorta para a bbox do octógono e preenche os pixels FORA do octógono
+    (mas dentro da bbox) com a cor real do papel, amostrada de dentro do
+    próprio octógono. Resultado: a bbox inteira fica na coloração do
+    papel, pronta para copyMakeBorder(BORDER_REPLICATE) sem introduzir
+    cores externas (mesa, sombra, etc).
+    """
+    if not polygon:
+        return frame, 0, 0
+
+    paper_color = sample_paper_color(frame, polygon)
+    return crop_to_polygon_bbox(frame, polygon, fill_color=paper_color)
+
+
+def crop_to_bbox_only(frame, polygon):
+    """
+    Recorta para a bounding box do octógono SEM mascarar nada — mantém
+    todos os pixels reais (inclusive os cantos fora do octógono mas
+    dentro da bbox, que são fundo real do tray).
+    """
+    if not polygon:
+        return frame, 0, 0
+    h, w = frame.shape[:2]
+    pts = np.array(polygon, dtype=np.int32)
+    x, y, bw, bh = cv2.boundingRect(pts)
+    x = max(0, x); y = max(0, y)
+    bw = min(bw, w-x); bh = min(bh, h-y)
+    crop = frame[y:y+bh, x:x+bw].copy()
+    return crop, x, y
+
+
 def save_inference_roi(polygon):
     cfg = {}
     if CAMERA_CONFIG.exists():

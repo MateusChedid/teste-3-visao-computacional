@@ -24,6 +24,7 @@ Controles:
 """
 
 import cv2
+import math
 import numpy as np
 import argparse
 import sys
@@ -44,7 +45,7 @@ except ImportError:
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from inference.result_reader import interpret_detections, RollResult
-from utils.roi_inference import load_inference_roi, crop_to_polygon_bbox
+from utils.roi_inference import load_inference_roi, crop_to_polygon_bbox_paper
 
 DICE_COLORS_BGR = {
     "d6":  (80,  200, 80),
@@ -61,8 +62,12 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 def octagon_to_square(img: np.ndarray, polygon: list):
     """
-    Recorta para a bbox do octógono, mascara (preto) fora dele, e centraliza
-    num canvas quadrado (lado = maior dimensão da bbox).
+    Recorta para a bbox do octógono, mascara (branco) fora dele, e
+    centraliza num canvas quadrado (lado = maior dimensão da bbox).
+
+    Este tamanho já corresponde ao tamanho final usado no dataset
+    (gerado por octagon_to_square_oversized + recorte seguro em
+    auto_collect.py) — nenhum recorte/zoom adicional é necessário aqui.
 
     Retorna (canvas, off_x, off_y, pad_x, pad_y) onde:
       off_x, off_y = posição da bbox do octógono no frame original
@@ -76,14 +81,19 @@ def octagon_to_square(img: np.ndarray, polygon: list):
         h, w = img.shape[:2]
         return img, 0, 0, 0, 0
 
-    masked, x, y = crop_to_polygon_bbox(img, polygon)
-    h, w = masked.shape[:2]
+    crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
+    h, w = crop.shape[:2]
     side = max(h, w)
 
-    canvas = np.full((side, side, 3), 255, dtype=masked.dtype)
-    pad_x = (side - w) // 2
-    pad_y = (side - h) // 2
-    canvas[pad_y:pad_y+h, pad_x:pad_x+w] = masked
+    pad_y_total = side - h
+    pad_x_total = side - w
+    pad_y = pad_y_total // 2
+    pad_x = pad_x_total // 2
+    bottom = pad_y_total - pad_y
+    right  = pad_x_total - pad_x
+
+    canvas = cv2.copyMakeBorder(crop, pad_y, bottom, pad_x, right,
+                                borderType=cv2.BORDER_REPLICATE)
     return canvas, x, y, pad_x, pad_y
 
 
@@ -267,7 +277,13 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = screenshots_dir / f"result_{ts}.jpg"
                 cv2.imwrite(str(path), display)
+                # Salvar também o canvas exato enviado ao modelo (debug)
+                ref_frame = frame if not frozen else frozen_frame
+                dbg_canvas, *_ = octagon_to_square(ref_frame, octagon)
+                dbg_path = screenshots_dir / f"canvas_{ts}.jpg"
+                cv2.imwrite(str(dbg_path), dbg_canvas)
                 print(f"[✓] Screenshot: {path}")
+                print(f"[✓] Canvas (entrada do modelo): {dbg_path}")
     except Exception as e:
         import traceback
         print(f"\n[ERRO] Loop interrompido por exceção: {e}")

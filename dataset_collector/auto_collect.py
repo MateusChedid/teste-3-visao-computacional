@@ -45,7 +45,7 @@ from utils.roi_inference import (
     run_selector as run_octagon_selector,
     save_inference_roi as save_octagon,
     load_inference_roi as load_octagon,
-    crop_to_polygon_bbox,
+    crop_to_polygon_bbox_paper,
 )
 
 N_ROTATIONS  = 80                       # rotações por foto
@@ -84,11 +84,16 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
     apenas conteúdo real capturado pela câmera.
 
     Mantém as cores originais — sem nenhuma alteração de exposição/cor.
+
+    Retorna (generated_paths, transforms) onde transforms[i] é um dict
+    com 'matrix' (M 2x3 de getRotationMatrix2D) e 'crop_offset' (cx-half_safe,
+    cy-half_safe) — usados para projetar uma bbox da rotação 0° para a
+    rotação i, via transform_bbox_for_rotation().
     """
     img = cv2.imread(str(img_path))
     if img is None:
         print(f"  [ERRO] Não foi possível ler {img_path.name}")
-        return []
+        return [], []
 
     h, w = img.shape[:2]
     if h != w:
@@ -114,7 +119,8 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
     half_safe = safe_size // 2
     cx, cy = w // 2, h // 2
 
-    generated = []
+    generated  = []
+    transforms = []
     for i in range(n_rotations):
         angle   = i * step
         M       = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -130,8 +136,72 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
         out_path = out_dir / f"{img_path.stem}_{i:03d}.jpg"
         cv2.imwrite(str(out_path), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
         generated.append(out_path)
+        transforms.append({
+            "matrix": M,
+            "crop_offset": (cx - half_safe, cy - half_safe),
+            "safe_size": safe_size,
+        })
 
-    return generated
+    return generated, transforms
+
+
+def transform_bbox_for_rotation(bbox_px, transform, ref_offset):
+    """
+    Projeta uma bbox (xmin,ymin,xmax,ymax) — definida no espaço RECORTADO
+    (safe_size²) da rotação 0° — para o espaço recortado da rotação alvo.
+
+    Passos:
+      1. bbox_px está em coordenadas locais da rotação 0° (safe_size²).
+         Como a rotação 0° é a identidade, essas coordenadas no canvas
+         oversized são (bbox_px + ref_offset).
+      2. Aplica M (rotação da rotação alvo) a essas coordenadas do canvas
+         oversized.
+      3. Subtrai o crop_offset da rotação ALVO para voltar ao espaço
+         recortado dela.
+
+    ref_offset    = crop_offset da rotação 0° (igual para todas, pois
+                    safe_size/centro não mudam — incluído por clareza)
+    transform     = dict da rotação ALVO, com 'matrix' e 'crop_offset'
+
+    Retorna (xmin,ymin,xmax,ymax) no espaço recortado da rotação alvo,
+    ou None se cair totalmente fora do recorte.
+    """
+    M = transform["matrix"]
+    off_x, off_y = transform["crop_offset"]
+    ref_off_x, ref_off_y = ref_offset
+    safe_size = transform["safe_size"]
+
+    xmin, ymin, xmax, ymax = bbox_px
+    # Converter para coordenadas do canvas oversized (rotação 0° = identidade)
+    xmin += ref_off_x; xmax += ref_off_x
+    ymin += ref_off_y; ymax += ref_off_y
+
+    corners = np.array([
+        [xmin, ymin],
+        [xmax, ymin],
+        [xmax, ymax],
+        [xmin, ymax],
+    ], dtype=np.float64)
+
+    ones = np.ones((4, 1))
+    corners_h = np.hstack([corners, ones])          # (4,3)
+    transformed = (M @ corners_h.T).T               # (4,2) — coords do canvas oversized rotacionado
+
+    # Voltar ao espaço recortado da rotação alvo
+    transformed[:, 0] -= off_x
+    transformed[:, 1] -= off_y
+
+    nx1, ny1 = transformed.min(axis=0)
+    nx2, ny2 = transformed.max(axis=0)
+
+    # Clipar ao tamanho final
+    nx1 = max(0, nx1); ny1 = max(0, ny1)
+    nx2 = min(safe_size, nx2); ny2 = min(safe_size, ny2)
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None
+
+    return (nx1, ny1, nx2, ny2)
 
 
 # ─── Auto Boxer ───────────────────────────────────────────────────────────────
@@ -147,46 +217,52 @@ def _box_area_frac(xmin, ymin, xmax, ymax, img_w, img_h):
     return (bw * bh) / (img_w * img_h)
 
 
-def auto_bbox(model, img_path: Path, class_id: int, label_dir: Path, preview_dir: Path):
+def detect_bbox_px(model, img_path: Path):
+    """
+    Roda o modelo (até 2x) e retorna a primeira bbox (xmin,ymin,xmax,ymax)
+    em pixels que respeite o filtro de tamanho, ou None se nada for válido.
+    Não escreve nenhum arquivo.
+    """
     img = cv2.imread(str(img_path))
     if img is None:
-        return False
-
+        return None
     img_h, img_w = img.shape[:2]
 
-    # Tentar detecção em duas confianças
     results = model(str(img_path), conf=0.15, augment=True, verbose=False)
     boxes   = results[0].boxes
     if len(boxes) == 0:
         results = model(str(img_path), conf=0.05, augment=True, verbose=False)
         boxes   = results[0].boxes
 
-    # Procurar, entre todas as boxes candidatas, a primeira que respeite
-    # o filtro de tamanho (ordenadas por confiança, já vem ordenado pelo YOLO)
-    valid_box = None
     for box in boxes:
         bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
         frac = _box_area_frac(bx1, by1, bx2, by2, img_w, img_h)
         if MIN_AREA_FRAC <= frac <= MAX_AREA_FRAC:
-            valid_box = (bx1, by1, bx2, by2)
-            break
+            return (float(bx1), float(by1), float(bx2), float(by2))
 
-    detected = valid_box is not None
-    if detected:
-        xmin, ymin, xmax, ymax = valid_box
-    else:
-        # Fallback: caixa central de tamanho fixo (40% da imagem)
-        # — mais conservador que o fallback anterior de 70%
-        m = 0.30
-        xmin, ymin = int(img_w*m), int(img_h*m)
-        xmax, ymax = int(img_w*(1-m)), int(img_h*(1-m))
+    return None
 
-    xmin, xmax = max(0, xmin), min(img_w, xmax)
-    ymin, ymax = max(0, ymin), min(img_h, ymax)
+
+def write_label_from_bbox_px(img_path: Path, class_id: int, bbox_px: tuple,
+                             label_dir: Path, preview_dir: Path, tag: str = "OK"):
+    """
+    Escreve o .txt YOLO e o preview a partir de uma bbox em PIXELS
+    (xmin,ymin,xmax,ymax) — sem rodar o modelo.
+    """
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return
+    img_h, img_w = img.shape[:2]
+
+    xmin, ymin, xmax, ymax = bbox_px
+    xmin = max(0.0, min(xmin, img_w))
+    xmax = max(0.0, min(xmax, img_w))
+    ymin = max(0.0, min(ymin, img_h))
+    ymax = max(0.0, min(ymax, img_h))
     bw, bh = xmax - xmin, ymax - ymin
     if bw <= 0 or bh <= 0:
-        xmin, ymin = int(img_w*.30), int(img_h*.30)
-        xmax, ymax = int(img_w*.70), int(img_h*.70)
+        xmin, ymin = img_w*.30, img_h*.30
+        xmax, ymax = img_w*.70, img_h*.70
         bw, bh = xmax - xmin, ymax - ymin
 
     xc = (xmin + bw/2) / img_w
@@ -198,14 +274,11 @@ def auto_bbox(model, img_path: Path, class_id: int, label_dir: Path, preview_dir
 
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview = img.copy()
-    color   = (0, 200, 80) if detected else (80, 80, 220)
-    cv2.rectangle(preview, (xmin, ymin), (xmax, ymax), color, 3)
-    cv2.putText(preview, "OK" if detected else "FALLBACK",
-                (xmin, max(ymin - 8, 14)),
+    color = (0, 200, 80) if tag == "OK" else (0, 200, 255)
+    cv2.rectangle(preview, (int(xmin), int(ymin)), (int(xmax), int(ymax)), color, 3)
+    cv2.putText(preview, tag, (int(xmin), max(int(ymin)-8, 14)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     cv2.imwrite(str(preview_dir / img_path.name), preview)
-
-    return detected
 
 
 # ─── Distribuição em splits ────────────────────────────────────────────────────
@@ -219,22 +292,58 @@ def copy_to_split(img_path: Path, lbl_path: Path, split: str):
 
 def octagon_to_square(img: np.ndarray, polygon: list) -> np.ndarray:
     """
-    Recorta a imagem para a bounding box do octógono, mascara pixels fora
-    dele (preto), e depois centraliza esse recorte num CANVAS QUADRADO
-    (lado = maior dimensão da bbox), preenchendo a sobra com preto.
+    Recorta a imagem para a bounding box do octógono (sem mascarar) e
+    centraliza num CANVAS QUADRADO (lado = maior dimensão da bbox),
+    preenchendo a sobra ESTICANDO as bordas reais da imagem
+    (cv2.BORDER_REPLICATE) — mantém a coloração real do papel/fundo
+    em vez de um branco artificial com contraste abrupto.
 
-    Essa máscara/canvas é o que tanto o auto_collect (treino) quanto o
-    detect.py (inferência) vão produzir a partir do octógono — garantindo
-    consistência total de escala e formato.
+    Este é o tamanho FINAL/alvo (igual ao que detect.py usa na inferência,
+    sem nenhum recorte adicional).
     """
-    masked, x, y = crop_to_polygon_bbox(img, polygon)
-    h, w = masked.shape[:2]
+    crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
+    h, w = crop.shape[:2]
     side = max(h, w)
 
-    canvas = np.full((side, side, 3), 255, dtype=masked.dtype)
-    off_y = (side - h) // 2
-    off_x = (side - w) // 2
-    canvas[off_y:off_y+h, off_x:off_x+w] = masked
+    pad_y = side - h
+    pad_x = side - w
+    top    = pad_y // 2
+    bottom = pad_y - top
+    left   = pad_x // 2
+    right  = pad_x - left
+
+    canvas = cv2.copyMakeBorder(crop, top, bottom, left, right,
+                                borderType=cv2.BORDER_REPLICATE)
+    return canvas
+
+
+def octagon_to_square_oversized(img: np.ndarray, polygon: list) -> np.ndarray:
+    """
+    Como octagon_to_square(), mas o canvas final é AMPLIADO por um fator
+    de 1/cos(45°) = sqrt(2) em relação ao tamanho alvo.
+
+    Motivo: generate_rotations() precisa girar a imagem e recortar um
+    quadrado central "seguro" (lado/sqrt(2)) para não ter bordas
+    replicadas (em relação ao CANVAS — o conteúdo real já preenche tudo,
+    já que usamos BORDER_REPLICATE). Se começarmos com um canvas sqrt(2)
+    vezes maior que o alvo, o recorte seguro pós-rotação resulta
+    EXATAMENTE no tamanho alvo (mesmo tamanho do octógono usado na
+    inferência) — sem nenhum "zoom" residual.
+    """
+    crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
+    h, w = crop.shape[:2]
+    target_side = max(h, w)
+    over_side   = int(round(target_side * math.sqrt(2)))
+
+    pad_y = over_side - h
+    pad_x = over_side - w
+    top    = pad_y // 2
+    bottom = pad_y - top
+    left   = pad_x // 2
+    right  = pad_x - left
+
+    canvas = cv2.copyMakeBorder(crop, top, bottom, left, right,
+                                borderType=cv2.BORDER_REPLICATE)
     return canvas
 
 
@@ -272,16 +381,16 @@ class _BoxDrawer:
         return (x1, y1, x2, y2)
 
 
-def manual_bbox_select(img_path: Path, stem_label: str) -> tuple | None:
+def manual_bbox_select_px(img_path: Path, stem_label: str) -> tuple | None:
     """
     Exibe a imagem e permite desenhar um bbox manualmente.
-    Retorna (xc_frac, yc_frac, bw_frac, bh_frac) ou None se pulado.
+    Retorna (xmin,ymin,xmax,ymax) em PIXELS ou None se pulado.
 
     Controles:
       Arrastar      → desenhar caixa
       ENTER / C     → confirmar
       Z / R         → limpar e redesenhar
-      Q             → pular esta face (mantém fallback automático)
+      Q             → pular esta face
     """
     img = cv2.imread(str(img_path))
     if img is None:
@@ -313,10 +422,7 @@ def manual_bbox_select(img_path: Path, stem_label: str) -> tuple | None:
         if key in (13, ord("c")):
             if box:
                 x1, y1, x2, y2 = box
-                bw, bh = x2 - x1, y2 - y1
-                xc = (x1 + bw/2) / w
-                yc = (y1 + bh/2) / h
-                result = (xc, yc, bw/w, bh/h)
+                result = (float(x1), float(y1), float(x2), float(y2))
                 break
 
         elif key in (ord("z"), ord("r")):
@@ -331,41 +437,22 @@ def manual_bbox_select(img_path: Path, stem_label: str) -> tuple | None:
     return result
 
 
-def write_label_from_fraction(img_path: Path, class_id: int,
-                               box_frac: tuple, label_dir: Path,
-                               preview_dir: Path, tag: str = "MANUAL"):
-    """
-    Escreve o .txt YOLO e o preview a partir de uma bbox já em fração
-    (xc, yc, bw, bh) — usado para aplicar a seleção manual a outras rotações.
-    """
-    img = cv2.imread(str(img_path))
-    if img is None:
-        return
-    h, w = img.shape[:2]
-    xc, yc, bwf, bhf = box_frac
-
-    label_dir.mkdir(parents=True, exist_ok=True)
-    with open(label_dir / (img_path.stem + ".txt"), "w") as f:
-        f.write(f"{class_id} {xc:.6f} {yc:.6f} {bwf:.6f} {bhf:.6f}\n")
-
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    preview = img.copy()
-    x1 = int((xc - bwf/2) * w); x2 = int((xc + bwf/2) * w)
-    y1 = int((yc - bhf/2) * h); y2 = int((yc + bhf/2) * h)
-    color = (0, 200, 255)
-    cv2.rectangle(preview, (x1, y1), (x2, y2), color, 3)
-    cv2.putText(preview, tag, (x1, max(y1-8, 14)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    cv2.imwrite(str(preview_dir / img_path.name), preview)
-
 
 # ─── Pipeline principal ────────────────────────────────────────────────────────
 
 def run_pipeline(images: list, class_map: dict, model, roi):
     """
     images: lista de (img_path, class_id)
-    Para cada foto: gera N_ROTATIONS rotações, bbox automática,
-    e divide entre train/val por VAL_FRACTION.
+
+    Para cada foto:
+      1. Gera o canvas oversized (octógono + replicate border)
+      2. Gera N_ROTATIONS rotações geométricas a partir desse canvas
+      3. Detecta a bbox automaticamente APENAS na rotação 0°
+         (1 chamada ao modelo por face, não 80)
+      4. Se a automática falhar, oferece seleção manual (1 clique) na rotação 0°
+      5. Projeta essa bbox de referência geometricamente para as outras
+         79 rotações, via transform_bbox_for_rotation()
+      6. Divide entre train/val por VAL_FRACTION
     """
     preview_dir  = WORK_DIR / "bbox_preview"
     fallback_log = []
@@ -376,10 +463,8 @@ def run_pipeline(images: list, class_map: dict, model, roi):
           f"(passo {ROTATION_STEP_DEG:.1f}°)")
     print(f"  {n_val_per_face} vão para val, "
           f"{N_ROTATIONS - n_val_per_face} para train")
-    print(f"  [i] Após rotacionar, recorta-se o quadrado central seguro "
-          f"(~71% da ROI) para evitar bordas replicadas.")
-    print(f"      Garanta que o dado caiba dentro dessa área central "
-          f"mesmo girado — deixe margem na ROI.\n")
+    print(f"  [i] A bbox é detectada (ou desenhada manualmente) UMA VEZ "
+          f"na rotação 0° e projetada geometricamente para as demais.\n")
 
     for idx, (img_path, class_id) in enumerate(images, 1):
         stem    = img_path.stem
@@ -388,59 +473,62 @@ def run_pipeline(images: list, class_map: dict, model, roi):
 
         print(f"  [{idx}/{len(images)}] {stem}")
 
-        # Recortar para ROI quadrada antes de rotacionar
         img = cv2.imread(str(img_path))
         if img is None:
             print(f"    [ERRO] não foi possível ler {img_path.name}")
             continue
-        cropped = octagon_to_square(img, roi) if roi else img
+        cropped = octagon_to_square_oversized(img, roi) if roi else img
 
         tmp_path = WORK_DIR / "cropped" / f"{stem}.jpg"
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(tmp_path), cropped, [cv2.IMWRITE_JPEG_QUALITY, 97])
 
-        rotated = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
+        rotated, transforms = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
         if not rotated:
             continue
 
-        det_flags = [
-            auto_bbox(model, r, class_id, lbl_dir, preview_dir)
-            for r in rotated
-        ]
-        det_ok = sum(det_flags)
-        fallback_idxs = [i for i, ok in enumerate(det_flags) if not ok]
-        fallback_n = len(fallback_idxs)
+        # ── Bbox de referência na rotação 0° ────────────────────────────────
+        ref_img = rotated[0]
+        bbox_px = detect_bbox_px(model, ref_img)
+        tag = "OK"
 
-        if fallback_n > 0:
-            fallback_log.append(f"{stem}: {fallback_n}/{len(rotated)} fallback")
-
-            print(f"    [!] {fallback_n} rotação(ões) caíram em fallback "
-                  f"automático para '{stem}'.")
+        if bbox_px is None:
+            print(f"    [!] Detecção automática falhou para '{stem}'.")
             ans = input("        Selecionar manualmente a região do dado "
-                         "para corrigir? [S/n]: ").strip().lower()
-
+                         "(rotação 0°)? [S/n]: ").strip().lower()
             if ans != "n":
-                # Mostrar a primeira rotação que caiu em fallback
-                ref_idx = fallback_idxs[0]
-                ref_img = rotated[ref_idx]
-                print(f"        Desenhe a caixa em volta do {stem} "
-                      f"(rotação {ref_idx:03d}).")
-                box_frac = manual_bbox_select(ref_img, stem)
+                print(f"        Desenhe a caixa em volta do {stem}.")
+                bbox_px = manual_bbox_select_px(ref_img, stem)
+                tag = "MANUAL"
 
-                if box_frac is not None:
-                    # Aplicar a MESMA caixa (em fração) a todas as rotações
-                    # que caíram em fallback para esta face
-                    for i in fallback_idxs:
-                        write_label_from_fraction(
-                            rotated[i], class_id, box_frac,
-                            lbl_dir, preview_dir, tag="MANUAL"
-                        )
-                    print(f"        [✓] Caixa manual aplicada a "
-                          f"{fallback_n} rotação(ões).")
-                else:
-                    print("        [i] Pulado — mantido fallback automático.")
+            if bbox_px is None:
+                # Último recurso: caixa central de 40%
+                im0 = cv2.imread(str(ref_img))
+                h0, w0 = im0.shape[:2]
+                m = 0.30
+                bbox_px = (w0*m, h0*m, w0*(1-m), h0*(1-m))
+                tag = "FALLBACK"
+                fallback_log.append(f"{stem}: sem detecção/seleção — fallback central 40%")
 
-        # Dividir entre val e train (índices aleatórios para val)
+        # ── Escrever label da rotação 0° ─────────────────────────────────────
+        write_label_from_bbox_px(rotated[0], class_id, bbox_px, lbl_dir, preview_dir, tag=tag)
+
+        # ── Projetar geometricamente para as demais rotações ────────────────
+        ref_offset = transforms[0]["crop_offset"]
+        n_ok = 1
+        for i in range(1, len(rotated)):
+            proj = transform_bbox_for_rotation(bbox_px, transforms[i], ref_offset)
+            if proj is None:
+                # Bbox saiu do recorte nesta rotação — usa a mesma posição
+                # da rotação 0° como aproximação (raro, geralmente não ocorre
+                # pois o dado está centralizado)
+                proj = bbox_px
+            else:
+                n_ok += 1
+            write_label_from_bbox_px(rotated[i], class_id, proj, lbl_dir, preview_dir,
+                                     tag=tag if tag != "OK" else "OK")
+
+        # ── Dividir entre val e train ────────────────────────────────────────
         idxs = list(range(len(rotated)))
         random.shuffle(idxs)
         val_idxs = set(idxs[:n_val_per_face])
@@ -453,19 +541,21 @@ def run_pipeline(images: list, class_map: dict, model, roi):
             copy_to_split(rot_img, lbl, split)
             counts[split] += 1
 
-        print(f"    {len(rotated)} rotações — {det_ok} OK, {fallback_n} fallback")
+        print(f"    {len(rotated)} rotações — bbox base: {tag}, "
+              f"{n_ok}/{len(rotated)} projetadas dentro do recorte")
 
     print(f"\n  [✓] Dataset gerado:")
     print(f"      train: {counts['train']} imagens")
     print(f"      val:   {counts['val']} imagens")
 
     if fallback_log:
-        print(f"\n  [AVISO] Faces com fallback (corrigidas manualmente se aceito):")
+        print(f"\n  [AVISO] Faces sem detecção/seleção (fallback central 40%):")
         for l in fallback_log:
             print(f"    {l}")
         print(f"  Verifique previews em {preview_dir}")
 
     print(f"\n  Próximo passo: python dataset_collector/validate_dataset.py\n")
+
 
 
 # ─── Webcam capture ────────────────────────────────────────────────────────────
