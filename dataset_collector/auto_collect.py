@@ -585,16 +585,19 @@ def webcam_capture_one(dice_type: str, face: int, camera_index: int, roi) -> Pat
         h, w = display.shape[:2]
 
         if roi:
-            x1, y1, x2, y2 = roi
+            pts = np.array(roi, dtype=np.int32)
             mask = np.zeros((h, w), dtype=np.uint8)
-            mask[y1:y2, x1:x2] = 255
+            cv2.fillPoly(mask, [pts], 255)
             dark = (display * 0.4).astype(np.uint8)
             display = np.where(np.stack([mask]*3, axis=2) > 0, display, dark)
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 220, 80), 2)
+            cv2.polylines(display, [pts], isClosed=True, color=(0, 220, 80), thickness=2)
 
-            # Cruz no centro da ROI — posição ideal para o dado
-            roi_cx, roi_cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cross_len = max(12, (x2 - x1) // 12)
+            # Cruz no centro do octógono — posição ideal para o dado
+            xs = [p[0] for p in roi]
+            ys = [p[1] for p in roi]
+            roi_cx = int((min(xs) + max(xs)) / 2)
+            roi_cy = int((min(ys) + max(ys)) / 2)
+            cross_len = max(12, (max(xs) - min(xs)) // 12)
         else:
             roi_cx, roi_cy = w // 2, h // 2
             cross_len = max(12, min(w, h) // 24)
@@ -621,8 +624,8 @@ def webcam_capture_one(dice_type: str, face: int, camera_index: int, roi) -> Pat
             saved = path
             flash = frame.copy()
             if roi:
-                x1,y1,x2,y2 = roi
-                cv2.rectangle(flash, (x1,y1), (x2,y2), (60,220,60), 4)
+                pts = np.array(roi, dtype=np.int32)
+                cv2.polylines(flash, [pts], isClosed=True, color=(60,220,60), thickness=4)
             cv2.putText(flash, "SALVO!", (w//2-80, h//2),
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (60,220,60), 3)
             cv2.imshow("Captura", flash)
