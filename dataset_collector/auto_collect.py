@@ -97,7 +97,9 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
          inscrito seguro, BORDER_REPLICATE só preenche cantos vazios
          com pixels vizinhos reais, sem esticar conteúdo de fora.
 
-    Mantém as cores originais — sem alteração de exposição/cor.
+    Converte para escala de cinza (3 canais BGR iguais) — robustez a
+    variações de cor/iluminação; o modelo aprende forma/contraste.
+    A mesma conversão deve ser aplicada na inferência (detect.py).
 
     Retorna lista de paths gerados.
     """
@@ -119,6 +121,12 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
     cx, cy = orig_w // 2, orig_h // 2
     half = safe_size // 2
     center_square = img[cy-half:cy+half, cx-half:cx+half]
+
+    # Converter para escala de cinza (3 canais, BGR iguais) — o modelo
+    # passa a focar em forma/contraste/textura, ignorando cor. A mesma
+    # conversão é aplicada na inferência (detect.py).
+    gray = cv2.cvtColor(center_square, cv2.COLOR_BGR2GRAY)
+    center_square = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     seg_center = (safe_size / 2.0, safe_size / 2.0)

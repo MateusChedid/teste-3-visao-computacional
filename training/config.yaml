@@ -17,10 +17,10 @@ warmup_epochs: 3.0
 warmup_momentum: 0.8
 
 # Augmentation online
-hsv_h:      0.015
-hsv_s:      0.5
-hsv_v:      0.3
-degrees:    180.0
+hsv_h:      0.0    # dataset em P&B — variar matiz não tem efeito/sentido
+hsv_s:      0.0    # dataset em P&B — variar saturação não tem efeito/sentido
+hsv_v:      0.3    # variação de brilho — mantém robustez à iluminação
+degrees:    180.0     # rotação completa — dados caem em qualquer ângulo
 translate:  0.1
 scale:      0.3
 shear:      5.0
@@ -34,12 +34,6 @@ copy_paste: 0.1
 box: 7.5
 cls: 0.5
 dfl: 1.5
-
-# AMP — H100 suporta perfeitamente float16/bfloat16
-amp: true
-
-# Cache dataset inteiro na RAM — H100 tem RAM de sobra no servidor
-cache: ram
 
 save:        true
 save_period: 10

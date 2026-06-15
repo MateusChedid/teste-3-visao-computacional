@@ -60,6 +60,16 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # ─── ROI: octógono → canvas quadrado mascarado ─────────────────────────────────
 
+def to_grayscale_bgr(img: np.ndarray) -> np.ndarray:
+    """
+    Converte para escala de cinza (3 canais BGR iguais) — mesma conversão
+    aplicada ao dataset em auto_collect.py. O modelo foi treinado em P&B;
+    a exibição (overlay, bboxes) continua usando o frame original em cores.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
 def octagon_to_square(img: np.ndarray, polygon: list):
     """
     Recorta para a bbox do octógono e centraliza num canvas quadrado
@@ -244,8 +254,9 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
                 prev_time = now
 
                 canvas, off_x, off_y, pad_x, pad_y, safe_off = octagon_to_square(frame, octagon)
+                canvas_gray = to_grayscale_bgr(canvas)
 
-                results    = model.predict(canvas, conf=conf_thr, verbose=False,
+                results    = model.predict(canvas_gray, conf=conf_thr, verbose=False,
                                            imgsz=640,
                                            iou=cfg.get("iou_threshold", 0.45))
                 detections = yolo_to_detections(results, class_names,
@@ -311,7 +322,8 @@ def run_image(model, class_names, cfg, source, use_roi=True):
             continue
 
         canvas, off_x, off_y, pad_x, pad_y, safe_off = octagon_to_square(frame, octagon)
-        results    = model.predict(canvas, conf=conf_thr, verbose=False)
+        canvas_gray = to_grayscale_bgr(canvas)
+        results    = model.predict(canvas_gray, conf=conf_thr, verbose=False)
         detections = yolo_to_detections(results, class_names, off_x, off_y, pad_x, pad_y, safe_off)
         roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
