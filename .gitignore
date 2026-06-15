@@ -11,6 +11,9 @@ runs/
 
 # Exceto o modelo final
 !best.pt
+!best-preto-branco.pt
+!best-com-cor.pt
+
 
 # Pesos YOLO baixados da Ultralytics
 yolov8*.pt
