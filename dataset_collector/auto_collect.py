@@ -48,11 +48,20 @@ from utils.roi_inference import (
     crop_to_polygon_bbox_paper,
 )
 
-N_ROTATIONS  = 80                       # rotações por foto
-ROTATION_STEP_DEG = 360.0 / N_ROTATIONS  # = 4.5°
+N_ROTATIONS  = 90                       # rotações por foto (passo 4°, igual ref.)
+ROTATION_STEP_DEG = 360.0 / N_ROTATIONS  # = 4.0°
 
-# Fração de rotações que vai para val (o restante vai para train)
-VAL_FRACTION = 0.10   # 10% das 80 rotações → val (= 8 imagens)
+# Confiança de detecção — 3 níveis decrescentes
+PRIMARY_CONF  = 0.15
+FALLBACK_CONF = 0.05
+MIN_CONF      = 0.001
+
+# Resolução de entrada do modelo na detecção (maior = mais detalhe
+# para objetos pequenos, mas mais lento por imagem)
+DETECT_IMGSZ = 960
+
+# Fração de rotações que vai para val
+VAL_FRACTION = 0.10
 
 DICE_FACES = {
     "d6":  list(range(1, 7)),
@@ -75,172 +84,178 @@ def load_class_map():
 
 def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTATIONS):
     """
-    Gera n_rotations rotações da imagem, igualmente espaçadas em 360°.
+    Gera n_rotations rotações, igualmente espaçadas em 360° (passo 4°),
+    seguindo o padrão de referência:
 
-    Para evitar esticar/replicar bordas: a imagem de entrada deve ter uma
-    margem extra em torno do dado (maior que o quadrado final desejado).
-    Esta função rotaciona o quadrado inteiro e depois recorta o quadrado
-    central "seguro" (inscrito), que nunca contém pixels replicados —
-    apenas conteúdo real capturado pela câmera.
+      1. Extrai o quadrado central "seguro" (lado = menor_lado / sqrt(2))
+         da imagem de entrada — esse quadrado, ao ser rotacionado em
+         torno do seu próprio centro, nunca expõe área fora da imagem
+         original.
+      2. Para cada ângulo, rotaciona ESSE quadrado já reduzido (dentro
+         de suas próprias dimensões), usando BORDER_REPLICATE para
+         preencher os cantos que "saem" — como o quadrado já é o
+         inscrito seguro, BORDER_REPLICATE só preenche cantos vazios
+         com pixels vizinhos reais, sem esticar conteúdo de fora.
 
-    Mantém as cores originais — sem nenhuma alteração de exposição/cor.
+    Mantém as cores originais — sem alteração de exposição/cor.
 
-    Retorna (generated_paths, transforms) onde transforms[i] é um dict
-    com 'matrix' (M 2x3 de getRotationMatrix2D) e 'crop_offset' (cx-half_safe,
-    cy-half_safe) — usados para projetar uma bbox da rotação 0° para a
-    rotação i, via transform_bbox_for_rotation().
+    Retorna lista de paths gerados.
     """
     img = cv2.imread(str(img_path))
     if img is None:
         print(f"  [ERRO] Não foi possível ler {img_path.name}")
-        return [], []
+        return []
 
-    h, w = img.shape[:2]
-    if h != w:
-        side = min(h, w)
-        cy, cx = h // 2, w // 2
-        half = side // 2
-        img = img[cy-half:cy+half, cx-half:cx+half]
-        h = w = img.shape[0]
+    orig_h, orig_w = img.shape[:2]
+    shortest_side = min(orig_w, orig_h)
 
-    # Tamanho do quadrado "seguro" inscrito após rotação:
-    # para qualquer ângulo, um quadrado de lado L/sqrt(2) centralizado
-    # dentro de um quadrado de lado L permanece sempre dentro após
-    # qualquer rotação em torno do centro.
-    safe_size = int(math.floor(h / math.sqrt(2)))
+    safe_size = int(math.floor(shortest_side / math.sqrt(2)))
     if safe_size % 2 != 0:
         safe_size -= 1
     if safe_size < 10:
-        safe_size = h  # imagem muito pequena, usa inteira mesmo
+        safe_size = shortest_side
+
+    # Extrair o quadrado central seguro da imagem original
+    cx, cy = orig_w // 2, orig_h // 2
+    half = safe_size // 2
+    center_square = img[cy-half:cy+half, cx-half:cx+half]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    center = (w / 2.0, h / 2.0)
-    step   = 360.0 / n_rotations
-    half_safe = safe_size // 2
-    cx, cy = w // 2, h // 2
+    seg_center = (safe_size / 2.0, safe_size / 2.0)
+    step = 360.0 / n_rotations
 
-    generated  = []
-    transforms = []
+    generated = []
     for i in range(n_rotations):
-        angle   = i * step
-        M       = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated_full = cv2.warpAffine(
-            img, M, (w, h),
+        angle = i * step
+        M = cv2.getRotationMatrix2D(seg_center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            center_square, M, (safe_size, safe_size),
             flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255),
+            borderMode=cv2.BORDER_REPLICATE,
         )
-        # Recorte central seguro — só pixels reais, sem replicação
-        rotated = rotated_full[cy-half_safe:cy+half_safe, cx-half_safe:cx+half_safe]
-
         out_path = out_dir / f"{img_path.stem}_{i:03d}.jpg"
         cv2.imwrite(str(out_path), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
         generated.append(out_path)
-        transforms.append({
-            "matrix": M,
-            "crop_offset": (cx - half_safe, cy - half_safe),
-            "safe_size": safe_size,
-        })
 
-    return generated, transforms
+    return generated
 
 
-def transform_bbox_for_rotation(bbox_px, transform, ref_offset):
+def detect_bbox_px(model, img_path: Path, search_frac: float = 1.0):
     """
-    Projeta uma bbox (xmin,ymin,xmax,ymax) — definida no espaço RECORTADO
-    (safe_size²) da rotação 0° — para o espaço recortado da rotação alvo.
+    Roda o modelo em até 3 níveis de confiança decrescentes
+    (PRIMARY_CONF → FALLBACK_CONF → MIN_CONF) e retorna a primeira bbox
+    que caiba INTEIRAMENTE dentro da região central de busca (search_frac
+    da imagem, centrada). Isso evita que o modelo confunda os cantos/
+    bordas do octógono (bboxes grandes, mesmo com centro no meio da
+    imagem) com o dado (sempre pequeno e centralizado).
 
-    Passos:
-      1. bbox_px está em coordenadas locais da rotação 0° (safe_size²).
-         Como a rotação 0° é a identidade, essas coordenadas no canvas
-         oversized são (bbox_px + ref_offset).
-      2. Aplica M (rotação da rotação alvo) a essas coordenadas do canvas
-         oversized.
-      3. Subtrai o crop_offset da rotação ALVO para voltar ao espaço
-         recortado dela.
+    Tenta os 3 níveis mesmo que o nível anterior tenha retornado boxes —
+    se nenhuma delas passar pelo filtro de região, tenta o próximo nível
+    de confiança (pode revelar uma detecção menor/melhor posicionada).
 
-    ref_offset    = crop_offset da rotação 0° (igual para todas, pois
-                    safe_size/centro não mudam — incluído por clareza)
-    transform     = dict da rotação ALVO, com 'matrix' e 'crop_offset'
+    search_frac = 1.0 → sem filtro (usa a imagem inteira)
+    search_frac = 0.6 → só aceita bboxes totalmente contidas nos 60%
+                         centrais da imagem
 
-    Retorna (xmin,ymin,xmax,ymax) no espaço recortado da rotação alvo,
-    ou None se cair totalmente fora do recorte.
-    """
-    M = transform["matrix"]
-    off_x, off_y = transform["crop_offset"]
-    ref_off_x, ref_off_y = ref_offset
-    safe_size = transform["safe_size"]
-
-    xmin, ymin, xmax, ymax = bbox_px
-    # Converter para coordenadas do canvas oversized (rotação 0° = identidade)
-    xmin += ref_off_x; xmax += ref_off_x
-    ymin += ref_off_y; ymax += ref_off_y
-
-    corners = np.array([
-        [xmin, ymin],
-        [xmax, ymin],
-        [xmax, ymax],
-        [xmin, ymax],
-    ], dtype=np.float64)
-
-    ones = np.ones((4, 1))
-    corners_h = np.hstack([corners, ones])          # (4,3)
-    transformed = (M @ corners_h.T).T               # (4,2) — coords do canvas oversized rotacionado
-
-    # Voltar ao espaço recortado da rotação alvo
-    transformed[:, 0] -= off_x
-    transformed[:, 1] -= off_y
-
-    nx1, ny1 = transformed.min(axis=0)
-    nx2, ny2 = transformed.max(axis=0)
-
-    # Clipar ao tamanho final
-    nx1 = max(0, nx1); ny1 = max(0, ny1)
-    nx2 = min(safe_size, nx2); ny2 = min(safe_size, ny2)
-
-    if nx2 <= nx1 or ny2 <= ny1:
-        return None
-
-    return (nx1, ny1, nx2, ny2)
-
-
-# ─── Auto Boxer ───────────────────────────────────────────────────────────────
-
-# Filtro de sanidade: a bbox precisa cobrir entre MIN_AREA_FRAC e MAX_AREA_FRAC
-# da área total da imagem. Fora desse range, a detecção é rejeitada.
-MIN_AREA_FRAC = 0.01   # bbox menor que 1% da imagem → provavelmente ruído
-MAX_AREA_FRAC = 0.70   # bbox maior que 70% da imagem → provavelmente pegou o tray/fundo
-
-
-def _box_area_frac(xmin, ymin, xmax, ymax, img_w, img_h):
-    bw, bh = max(0, xmax-xmin), max(0, ymax-ymin)
-    return (bw * bh) / (img_w * img_h)
-
-
-def detect_bbox_px(model, img_path: Path):
-    """
-    Roda o modelo (até 2x) e retorna a primeira bbox (xmin,ymin,xmax,ymax)
-    em pixels que respeite o filtro de tamanho, ou None se nada for válido.
+    Retorna (xmin,ymin,xmax,ymax) ou None se nada válido for encontrado.
     Não escreve nenhum arquivo.
     """
     img = cv2.imread(str(img_path))
-    if img is None:
-        return None
     img_h, img_w = img.shape[:2]
 
-    results = model(str(img_path), conf=0.15, augment=True, verbose=False)
-    boxes   = results[0].boxes
-    if len(boxes) == 0:
-        results = model(str(img_path), conf=0.05, augment=True, verbose=False)
+    if search_frac >= 0.999:
+        rx1, ry1, rx2, ry2 = 0, 0, img_w, img_h
+    else:
+        margin = (1 - search_frac) / 2.0
+        rx1, ry1 = img_w * margin, img_h * margin
+        rx2, ry2 = img_w * (1 - margin), img_h * (1 - margin)
+
+    for conf in (PRIMARY_CONF, FALLBACK_CONF, MIN_CONF):
+        results = model(str(img_path), conf=conf, imgsz=DETECT_IMGSZ, verbose=False)
         boxes   = results[0].boxes
 
-    for box in boxes:
-        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-        frac = _box_area_frac(bx1, by1, bx2, by2, img_w, img_h)
-        if MIN_AREA_FRAC <= frac <= MAX_AREA_FRAC:
-            return (float(bx1), float(by1), float(bx2), float(by2))
+        for box in boxes:
+            xmin, ymin, xmax, ymax = map(float, box.xyxy[0].tolist())
+            if rx1 <= xmin and xmax <= rx2 and ry1 <= ymin and ymax <= ry2:
+                return (xmin, ymin, xmax, ymax)
 
     return None
+
+
+class _CenterSquareSelector:
+    """Seletor de quadrado central ajustável (apenas tamanho, sempre centrado)."""
+
+    def __init__(self, img_size: int):
+        self.img_size = img_size
+        self.frac = 0.6  # fração inicial
+
+    def mouse_cb(self, event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEWHEEL:
+            delta = 0.02 if flags > 0 else -0.02
+            self.frac = float(np.clip(self.frac + delta, 0.1, 1.0))
+
+    @property
+    def rect(self):
+        side = int(self.img_size * self.frac)
+        off = (self.img_size - side) // 2
+        return (off, off, off + side, off + side)
+
+
+def select_search_region(sample_img_path: Path) -> float:
+    """
+    Mostra uma rotação de exemplo e permite ajustar (scroll do mouse) um
+    quadrado centrado que define a região onde o sistema vai procurar o
+    dado. Retorna a fração (0.1 a 1.0) escolhida.
+
+    Controles:
+      Scroll        → aumentar/diminuir o quadrado
+      ENTER / C     → confirmar
+      Q             → cancelar (usa 1.0 = sem filtro)
+    """
+    img = cv2.imread(str(sample_img_path))
+    if img is None:
+        return 1.0
+
+    size = img.shape[0]
+    sel = _CenterSquareSelector(size)
+    win = "Selecionar regiao de busca do dado"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win, sel.mouse_cb)
+
+    print("\n" + "="*58)
+    print("  REGIÃO DE BUSCA DO DADO")
+    print("="*58)
+    print("  Ajuste o quadrado central para cobrir a área onde o dado")
+    print("  fica posicionado (evita confundir com os cantos do tray).")
+    print("  SCROLL = redimensionar   ENTER = confirmar   Q = pular\n")
+
+    result = 1.0
+    while True:
+        display = img.copy()
+        x1, y1, x2, y2 = sel.rect
+        mask = np.zeros((size, size), dtype=np.uint8)
+        mask[y1:y2, x1:x2] = 255
+        dark = (display * 0.35).astype(np.uint8)
+        display = np.where(np.stack([mask]*3, axis=2) > 0, display, dark)
+        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
+
+        cv2.rectangle(display, (0, 0), (size, 34), (0, 0, 0), -1)
+        cv2.putText(display,
+                    f"Regiao: {sel.frac*100:.0f}%  SCROLL=ajustar  ENTER=ok  Q=pular",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+        cv2.imshow(win, display)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, ord("c")):
+            result = sel.frac
+            break
+        elif key == ord("q"):
+            result = 1.0
+            break
+
+    cv2.destroyAllWindows()
+    return result
 
 
 def write_label_from_bbox_px(img_path: Path, class_id: int, bbox_px: tuple,
@@ -298,8 +313,8 @@ def octagon_to_square(img: np.ndarray, polygon: list) -> np.ndarray:
     (cv2.BORDER_REPLICATE) — mantém a coloração real do papel/fundo
     em vez de um branco artificial com contraste abrupto.
 
-    Este é o tamanho FINAL/alvo (igual ao que detect.py usa na inferência,
-    sem nenhum recorte adicional).
+    Este é o tamanho FINAL/alvo (lado = bbox do octógono), igual ao que
+    detect.py usa na inferência.
     """
     crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
     h, w = crop.shape[:2]
@@ -319,123 +334,31 @@ def octagon_to_square(img: np.ndarray, polygon: list) -> np.ndarray:
 
 def octagon_to_square_oversized(img: np.ndarray, polygon: list) -> np.ndarray:
     """
-    Como octagon_to_square(), mas o canvas final é AMPLIADO por um fator
-    de 1/cos(45°) = sqrt(2) em relação ao tamanho alvo.
+    Como octagon_to_square(), mas o canvas final é AMPLIADO por
+    sqrt(2) em relação ao tamanho alvo (bordas esticadas com a cor
+    real do papel via BORDER_REPLICATE).
 
-    Motivo: generate_rotations() precisa girar a imagem e recortar um
-    quadrado central "seguro" (lado/sqrt(2)) para não ter bordas
-    replicadas (em relação ao CANVAS — o conteúdo real já preenche tudo,
-    já que usamos BORDER_REPLICATE). Se começarmos com um canvas sqrt(2)
-    vezes maior que o alvo, o recorte seguro pós-rotação resulta
-    EXATAMENTE no tamanho alvo (mesmo tamanho do octógono usado na
-    inferência) — sem nenhum "zoom" residual.
+    Motivo: generate_rotations() extrai o quadrado central "seguro"
+    (lado/sqrt(2)) antes de rotacionar. Se a entrada já for sqrt(2)
+    vezes maior que o alvo, esse recorte resulta EXATAMENTE no tamanho
+    alvo (= tamanho do octógono usado na inferência) — sem reduzir o
+    dado, sem "zoom".
     """
     crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
     h, w = crop.shape[:2]
     target_side = max(h, w)
     over_side   = int(round(target_side * math.sqrt(2)))
 
-    pad_y = over_side - h
-    pad_x = over_side - w
-    top    = pad_y // 2
-    bottom = pad_y - top
-    left   = pad_x // 2
-    right  = pad_x - left
+    pad_y_total = over_side - h
+    pad_x_total = over_side - w
+    top    = pad_y_total // 2
+    bottom = pad_y_total - top
+    left   = pad_x_total // 2
+    right  = pad_x_total - left
 
     canvas = cv2.copyMakeBorder(crop, top, bottom, left, right,
                                 borderType=cv2.BORDER_REPLICATE)
     return canvas
-
-
-# ─── Seleção manual de bbox (para fallbacks) ──────────────────────────────────
-
-class _BoxDrawer:
-    """Desenho de um único bbox por clique-e-arraste."""
-
-    def __init__(self):
-        self.start = None
-        self.end   = None
-        self.drawing = False
-
-    def mouse_cb(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.start = (x, y)
-            self.end   = (x, y)
-            self.drawing = True
-        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
-            self.end = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.end = (x, y)
-            self.drawing = False
-
-    @property
-    def box(self):
-        if self.start is None or self.end is None:
-            return None
-        x1, y1 = self.start
-        x2, y2 = self.end
-        x1, x2 = min(x1, x2), max(x1, x2)
-        y1, y2 = min(y1, y2), max(y1, y2)
-        if x2 - x1 < 5 or y2 - y1 < 5:
-            return None
-        return (x1, y1, x2, y2)
-
-
-def manual_bbox_select_px(img_path: Path, stem_label: str) -> tuple | None:
-    """
-    Exibe a imagem e permite desenhar um bbox manualmente.
-    Retorna (xmin,ymin,xmax,ymax) em PIXELS ou None se pulado.
-
-    Controles:
-      Arrastar      → desenhar caixa
-      ENTER / C     → confirmar
-      Z / R         → limpar e redesenhar
-      Q             → pular esta face
-    """
-    img = cv2.imread(str(img_path))
-    if img is None:
-        return None
-
-    h, w = img.shape[:2]
-    drawer = _BoxDrawer()
-    win = f"Selecao manual - {stem_label}"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(win, drawer.mouse_cb)
-
-    result = None
-    while True:
-        display = img.copy()
-        box = drawer.box
-        if box:
-            x1, y1, x2, y2 = box
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
-
-        cv2.rectangle(display, (0, 0), (w, 34), (0, 0, 0), -1)
-        cv2.putText(display,
-                    f"{stem_label}: arraste a caixa no dado  "
-                    f"ENTER=ok  Z=limpar  Q=pular face",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
-
-        cv2.imshow(win, display)
-        key = cv2.waitKey(20) & 0xFF
-
-        if key in (13, ord("c")):
-            if box:
-                x1, y1, x2, y2 = box
-                result = (float(x1), float(y1), float(x2), float(y2))
-                break
-
-        elif key in (ord("z"), ord("r")):
-            drawer.start = None
-            drawer.end   = None
-
-        elif key == ord("q"):
-            result = None
-            break
-
-    cv2.destroyAllWindows()
-    return result
-
 
 
 # ─── Pipeline principal ────────────────────────────────────────────────────────
@@ -444,15 +367,14 @@ def run_pipeline(images: list, class_map: dict, model, roi):
     """
     images: lista de (img_path, class_id)
 
-    Para cada foto:
-      1. Gera o canvas oversized (octógono + replicate border)
-      2. Gera N_ROTATIONS rotações geométricas a partir desse canvas
-      3. Detecta a bbox automaticamente APENAS na rotação 0°
-         (1 chamada ao modelo por face, não 80)
-      4. Se a automática falhar, oferece seleção manual (1 clique) na rotação 0°
-      5. Projeta essa bbox de referência geometricamente para as outras
-         79 rotações, via transform_bbox_for_rotation()
-      6. Divide entre train/val por VAL_FRACTION
+    Para cada foto, seguindo o padrão de referência:
+      1. Gera o canvas do octógono (612×612, cor do papel nas bordas)
+      2. generate_rotations() extrai o quadrado seguro (612/√2≈432) e
+         gera N_ROTATIONS rotações DENTRO dele (BORDER_REPLICATE)
+      3. Para CADA rotação, roda detecção automática (igual a main.py
+         de referência): conf 0.15 → fallback conf 0.05 → fallback
+         usando a região calibrada (search_frac) se nada detectado
+      4. Divide entre train/val por VAL_FRACTION
     """
     preview_dir  = WORK_DIR / "bbox_preview"
     fallback_log = []
@@ -463,13 +385,48 @@ def run_pipeline(images: list, class_map: dict, model, roi):
           f"(passo {ROTATION_STEP_DEG:.1f}°)")
     print(f"  {n_val_per_face} vão para val, "
           f"{N_ROTATIONS - n_val_per_face} para train")
-    print(f"  [i] A bbox é detectada (ou desenhada manualmente) UMA VEZ "
-          f"na rotação 0° e projetada geometricamente para as demais.\n")
+    print(f"  [i] Detecção automática roda em CADA rotação "
+          f"(padrão de referência).\n")
+
+    # ── Calibração da região de busca POR TIPO DE DADO ──────────────────────
+    # Uma calibração para cada prefixo (d6, d8, d10, d12, d20), usando a
+    # primeira foto encontrada de cada tipo como exemplo.
+    search_fracs = {}
+    seen_types = set()
+    for img_path_i, _ in images:
+        dtype = img_path_i.stem.split("_")[0]
+        if dtype in seen_types:
+            continue
+        seen_types.add(dtype)
+
+        img0 = cv2.imread(str(img_path_i))
+        if img0 is None:
+            search_fracs[dtype] = 1.0
+            continue
+
+        cropped0 = octagon_to_square_oversized(img0, roi) if roi else img0
+        tmp0 = WORK_DIR / "cropped" / f"_calib_{dtype}.jpg"
+        tmp0.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(tmp0), cropped0, [cv2.IMWRITE_JPEG_QUALITY, 97])
+        rot0 = generate_rotations(tmp0, WORK_DIR / f"_calib_rot_{dtype}", n_rotations=1)
+
+        if rot0:
+            print(f"  Calibrando região de busca para {dtype.upper()}...")
+            search_fracs[dtype] = select_search_region(rot0[0])
+        else:
+            search_fracs[dtype] = 1.0
+
+    print()
+    for dtype, frac in search_fracs.items():
+        print(f"  [i] {dtype.upper()}: região de busca {frac*100:.0f}% central")
+    print()
 
     for idx, (img_path, class_id) in enumerate(images, 1):
         stem    = img_path.stem
         rot_dir = WORK_DIR / "rotations" / stem
         lbl_dir = WORK_DIR / "labels"    / stem
+        dtype   = stem.split("_")[0]
+        search_frac = search_fracs.get(dtype, 1.0)
 
         print(f"  [{idx}/{len(images)}] {stem}")
 
@@ -483,50 +440,27 @@ def run_pipeline(images: list, class_map: dict, model, roi):
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(tmp_path), cropped, [cv2.IMWRITE_JPEG_QUALITY, 97])
 
-        rotated, transforms = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
+        rotated = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
         if not rotated:
             continue
 
-        # ── Bbox de referência na rotação 0° ────────────────────────────────
-        ref_img = rotated[0]
-        bbox_px = detect_bbox_px(model, ref_img)
-        tag = "OK"
-
-        if bbox_px is None:
-            print(f"    [!] Detecção automática falhou para '{stem}'.")
-            ans = input("        Selecionar manualmente a região do dado "
-                         "(rotação 0°)? [S/n]: ").strip().lower()
-            if ans != "n":
-                print(f"        Desenhe a caixa em volta do {stem}.")
-                bbox_px = manual_bbox_select_px(ref_img, stem)
-                tag = "MANUAL"
-
-            if bbox_px is None:
-                # Último recurso: caixa central de 40%
-                im0 = cv2.imread(str(ref_img))
-                h0, w0 = im0.shape[:2]
-                m = 0.30
-                bbox_px = (w0*m, h0*m, w0*(1-m), h0*(1-m))
-                tag = "FALLBACK"
-                fallback_log.append(f"{stem}: sem detecção/seleção — fallback central 40%")
-
-        # ── Escrever label da rotação 0° ─────────────────────────────────────
-        write_label_from_bbox_px(rotated[0], class_id, bbox_px, lbl_dir, preview_dir, tag=tag)
-
-        # ── Projetar geometricamente para as demais rotações ────────────────
-        ref_offset = transforms[0]["crop_offset"]
-        n_ok = 1
-        for i in range(1, len(rotated)):
-            proj = transform_bbox_for_rotation(bbox_px, transforms[i], ref_offset)
-            if proj is None:
-                # Bbox saiu do recorte nesta rotação — usa a mesma posição
-                # da rotação 0° como aproximação (raro, geralmente não ocorre
-                # pois o dado está centralizado)
-                proj = bbox_px
+        # ── Detecção automática em CADA rotação ─────────────────────────────
+        det_ok = 0
+        for r in rotated:
+            bbox_px = detect_bbox_px(model, r, search_frac=search_frac)
+            if bbox_px is not None:
+                det_ok += 1
+                write_label_from_bbox_px(r, class_id, bbox_px, lbl_dir, preview_dir, tag="OK")
             else:
-                n_ok += 1
-            write_label_from_bbox_px(rotated[i], class_id, proj, lbl_dir, preview_dir,
-                                     tag=tag if tag != "OK" else "OK")
+                img_r = cv2.imread(str(r))
+                h0, w0 = img_r.shape[:2]
+                m = (1 - search_frac) / 2.0
+                bbox_px = (w0*m, h0*m, w0*(1-m), h0*(1-m))
+                write_label_from_bbox_px(r, class_id, bbox_px, lbl_dir, preview_dir, tag="FALLBACK")
+
+        fallback_n = len(rotated) - det_ok
+        if fallback_n > 0:
+            fallback_log.append(f"{stem}: {fallback_n}/{len(rotated)} fallback (região calibrada)")
 
         # ── Dividir entre val e train ────────────────────────────────────────
         idxs = list(range(len(rotated)))
@@ -541,15 +475,14 @@ def run_pipeline(images: list, class_map: dict, model, roi):
             copy_to_split(rot_img, lbl, split)
             counts[split] += 1
 
-        print(f"    {len(rotated)} rotações — bbox base: {tag}, "
-              f"{n_ok}/{len(rotated)} projetadas dentro do recorte")
+        print(f"    {len(rotated)} rotações — {det_ok} OK, {fallback_n} fallback")
 
     print(f"\n  [✓] Dataset gerado:")
     print(f"      train: {counts['train']} imagens")
     print(f"      val:   {counts['val']} imagens")
 
     if fallback_log:
-        print(f"\n  [AVISO] Faces sem detecção/seleção (fallback central 40%):")
+        print(f"\n  [AVISO] Faces com fallback:")
         for l in fallback_log:
             print(f"    {l}")
         print(f"  Verifique previews em {preview_dir}")

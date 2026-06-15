@@ -62,24 +62,20 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 def octagon_to_square(img: np.ndarray, polygon: list):
     """
-    Recorta para a bbox do octógono, mascara (branco) fora dele, e
-    centraliza num canvas quadrado (lado = maior dimensão da bbox).
+    Recorta para a bbox do octógono e centraliza num canvas quadrado
+    (lado = maior dimensão da bbox), preenchendo a sobra com
+    BORDER_REPLICATE (cor real do papel).
 
-    Este tamanho já corresponde ao tamanho final usado no dataset
-    (gerado por octagon_to_square_oversized + recorte seguro em
-    auto_collect.py) — nenhum recorte/zoom adicional é necessário aqui.
+    Este tamanho já corresponde ao tamanho final do dataset (gerado por
+    octagon_to_square_oversized + recorte seguro em auto_collect.py) —
+    nenhum recorte/zoom adicional é necessário aqui.
 
-    Retorna (canvas, off_x, off_y, pad_x, pad_y) onde:
-      off_x, off_y = posição da bbox do octógono no frame original
-      pad_x, pad_y = padding aplicado para centralizar no canvas quadrado
-
-    Para converter coordenadas do canvas de volta ao frame original:
-      x_original = x_canvas - pad_x + off_x
-      y_original = y_canvas - pad_y + off_y
+    Retorna (canvas, off_x, off_y, pad_x, pad_y, safe_off) — safe_off
+    sempre 0, mantido por compatibilidade de assinatura.
     """
     if not polygon:
         h, w = img.shape[:2]
-        return img, 0, 0, 0, 0
+        return img, 0, 0, 0, 0, 0
 
     crop, x, y = crop_to_polygon_bbox_paper(img, polygon)
     h, w = crop.shape[:2]
@@ -94,7 +90,8 @@ def octagon_to_square(img: np.ndarray, polygon: list):
 
     canvas = cv2.copyMakeBorder(crop, pad_y, bottom, pad_x, right,
                                 borderType=cv2.BORDER_REPLICATE)
-    return canvas, x, y, pad_x, pad_y
+
+    return canvas, x, y, pad_x, pad_y, 0
 
 
 def draw_roi_overlay(frame, polygon):
@@ -171,8 +168,8 @@ def draw_hud_top(frame, frozen=False, roi_active=False):
 
 
 def yolo_to_detections(yolo_results, class_names, off_x=0, off_y=0,
-                       pad_x=0, pad_y=0):
-    """Converte detecções do canvas quadrado de volta para coordenadas do frame original."""
+                       pad_x=0, pad_y=0, safe_off=0):
+    """Converte detecções do canvas final de volta para coordenadas do frame original."""
     detections = []
     for result in yolo_results:
         if result.boxes is None:
@@ -181,10 +178,10 @@ def yolo_to_detections(yolo_results, class_names, off_x=0, off_y=0,
             cid  = int(box.cls[0])
             conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            x1 = x1 - pad_x + off_x
-            x2 = x2 - pad_x + off_x
-            y1 = y1 - pad_y + off_y
-            y2 = y2 - pad_y + off_y
+            x1 = x1 + safe_off - pad_x + off_x
+            x2 = x2 + safe_off - pad_x + off_x
+            y1 = y1 + safe_off - pad_y + off_y
+            y2 = y2 + safe_off - pad_y + off_y
             cls_name = class_names.get(cid, "unknown")
             detections.append((cls_name, conf, (x1, y1, x2, y2)))
     return detections
@@ -246,13 +243,13 @@ def run_webcam(model, class_names, cfg, camera_index=0, use_roi=True):
                 fps = 0.9*fps + 0.1*(1.0/max(now-prev_time, 1e-5))
                 prev_time = now
 
-                canvas, off_x, off_y, pad_x, pad_y = octagon_to_square(frame, octagon)
+                canvas, off_x, off_y, pad_x, pad_y, safe_off = octagon_to_square(frame, octagon)
 
                 results    = model.predict(canvas, conf=conf_thr, verbose=False,
                                            imgsz=640,
                                            iou=cfg.get("iou_threshold", 0.45))
                 detections = yolo_to_detections(results, class_names,
-                                                off_x, off_y, pad_x, pad_y)
+                                                off_x, off_y, pad_x, pad_y, safe_off)
                 roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
                 display = draw_roi_overlay(frame.copy(), octagon)
@@ -313,9 +310,9 @@ def run_image(model, class_names, cfg, source, use_roi=True):
         if frame is None:
             continue
 
-        canvas, off_x, off_y, pad_x, pad_y = octagon_to_square(frame, octagon)
+        canvas, off_x, off_y, pad_x, pad_y, safe_off = octagon_to_square(frame, octagon)
         results    = model.predict(canvas, conf=conf_thr, verbose=False)
-        detections = yolo_to_detections(results, class_names, off_x, off_y, pad_x, pad_y)
+        detections = yolo_to_detections(results, class_names, off_x, off_y, pad_x, pad_y, safe_off)
         roll       = interpret_detections(detections, conf_threshold=conf_thr)
 
         display = draw_roi_overlay(frame.copy(), octagon)
