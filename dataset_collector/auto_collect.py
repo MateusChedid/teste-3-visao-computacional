@@ -48,7 +48,7 @@ from utils.roi_inference import (
     crop_to_polygon_bbox_paper,
 )
 
-N_ROTATIONS  = 90                       # rotações por foto (passo 4°, igual ref.)
+N_ROTATIONS  = 45                       # rotações por foto (passo 4°, igual ref.)
 ROTATION_STEP_DEG = 360.0 / N_ROTATIONS  # = 4.0°
 
 # Confiança de detecção — 3 níveis decrescentes
@@ -125,6 +125,7 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
     step = 360.0 / n_rotations
 
     generated = []
+    matrices  = []
     for i in range(n_rotations):
         angle = i * step
         M = cv2.getRotationMatrix2D(seg_center, angle, 1.0)
@@ -136,39 +137,44 @@ def generate_rotations(img_path: Path, out_dir: Path, n_rotations: int = N_ROTAT
         out_path = out_dir / f"{img_path.stem}_{i:03d}.jpg"
         cv2.imwrite(str(out_path), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
         generated.append(out_path)
+        matrices.append(M)
 
-    return generated
+    return generated, matrices
 
 
-def detect_bbox_px(model, img_path: Path, search_frac: float = 1.0):
+def rotate_rect(rect, M, img_size: int):
     """
-    Roda o modelo em até 3 níveis de confiança decrescentes
-    (PRIMARY_CONF → FALLBACK_CONF → MIN_CONF) e retorna a primeira bbox
-    que caiba INTEIRAMENTE dentro da região central de busca (search_frac
-    da imagem, centrada). Isso evita que o modelo confunda os cantos/
-    bordas do octógono (bboxes grandes, mesmo com centro no meio da
-    imagem) com o dado (sempre pequeno e centralizado).
+    Projeta um retângulo (x1,y1,x2,y2) pela matriz de rotação M
+    (2×3, de getRotationMatrix2D) e retorna a nova bounding box
+    axis-aligned, clipada ao tamanho da imagem.
+    """
+    x1, y1, x2, y2 = rect
+    corners = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float64)
+    ones = np.ones((4, 1))
+    ch = np.hstack([corners, ones])      # (4,3)
+    t  = (M @ ch.T).T                   # (4,2)
+    nx1, ny1 = t.min(axis=0)
+    nx2, ny2 = t.max(axis=0)
+    nx1 = max(0.0, nx1); ny1 = max(0.0, ny1)
+    nx2 = min(float(img_size), nx2); ny2 = min(float(img_size), ny2)
+    return (nx1, ny1, nx2, ny2)
 
-    Tenta os 3 níveis mesmo que o nível anterior tenha retornado boxes —
-    se nenhuma delas passar pelo filtro de região, tenta o próximo nível
-    de confiança (pode revelar uma detecção menor/melhor posicionada).
 
-    search_frac = 1.0 → sem filtro (usa a imagem inteira)
-    search_frac = 0.6 → só aceita bboxes totalmente contidas nos 60%
-                         centrais da imagem
+def detect_bbox_px(model, img_path: Path, search_rect=None):
+    """
+    Roda o modelo em até 3 níveis de confiança decrescentes e retorna a
+    primeira bbox que caiba INTEIRAMENTE dentro de search_rect
+    (x1,y1,x2,y2) em pixels. Se search_rect=None, aceita qualquer bbox.
 
-    Retorna (xmin,ymin,xmax,ymax) ou None se nada válido for encontrado.
-    Não escreve nenhum arquivo.
+    Retorna (xmin,ymin,xmax,ymax) ou None.
     """
     img = cv2.imread(str(img_path))
     img_h, img_w = img.shape[:2]
 
-    if search_frac >= 0.999:
-        rx1, ry1, rx2, ry2 = 0, 0, img_w, img_h
-    else:
-        margin = (1 - search_frac) / 2.0
-        rx1, ry1 = img_w * margin, img_h * margin
-        rx2, ry2 = img_w * (1 - margin), img_h * (1 - margin)
+    rx1, ry1 = 0, 0
+    rx2, ry2 = img_w, img_h
+    if search_rect is not None:
+        rx1, ry1, rx2, ry2 = search_rect
 
     for conf in (PRIMARY_CONF, FALLBACK_CONF, MIN_CONF):
         results = model(str(img_path), conf=conf, imgsz=DETECT_IMGSZ, verbose=False)
@@ -182,54 +188,90 @@ def detect_bbox_px(model, img_path: Path, search_frac: float = 1.0):
     return None
 
 
-class _CenterSquareSelector:
-    """Seletor de quadrado central ajustável (apenas tamanho, sempre centrado)."""
+class _RectSelector:
+    """
+    Seletor de retângulo livre: arrastar = mover, scroll = redimensionar.
+    Mantém a proporção quadrada para consistência com a detecção.
+    """
 
-    def __init__(self, img_size: int):
-        self.img_size = img_size
-        self.frac = 0.6  # fração inicial
+    def __init__(self, img_size: int, init_frac: float = 0.5):
+        self.size = img_size
+        side = int(img_size * init_frac)
+        cx, cy = img_size // 2, img_size // 2
+        self.x1 = cx - side // 2
+        self.y1 = cy - side // 2
+        self.x2 = cx + side // 2
+        self.y2 = cy + side // 2
+        self._drag = False
+        self._drag_ox = 0
+        self._drag_oy = 0
 
     def mouse_cb(self, event, x, y, flags, param):
-        if event == cv2.EVENT_MOUSEWHEEL:
-            delta = 0.02 if flags > 0 else -0.02
-            self.frac = float(np.clip(self.frac + delta, 0.1, 1.0))
+        side = self.x2 - self.x1
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._drag = True
+            self._drag_ox = x - self.x1
+            self._drag_oy = y - self.y1
+
+        elif event == cv2.EVENT_MOUSEMOVE and self._drag:
+            nx1 = x - self._drag_ox
+            ny1 = y - self._drag_oy
+            nx1 = int(np.clip(nx1, 0, self.size - side))
+            ny1 = int(np.clip(ny1, 0, self.size - side))
+            self.x1, self.y1 = nx1, ny1
+            self.x2, self.y2 = nx1 + side, ny1 + side
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag = False
+
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            cx = (self.x1 + self.x2) // 2
+            cy = (self.y1 + self.y2) // 2
+            delta = 8 if flags > 0 else -8
+            side = int(np.clip(side + delta, 10, self.size))
+            self.x1 = int(np.clip(cx - side // 2, 0, self.size - side))
+            self.y1 = int(np.clip(cy - side // 2, 0, self.size - side))
+            self.x2 = self.x1 + side
+            self.y2 = self.y1 + side
 
     @property
     def rect(self):
-        side = int(self.img_size * self.frac)
-        off = (self.img_size - side) // 2
-        return (off, off, off + side, off + side)
+        return (self.x1, self.y1, self.x2, self.y2)
 
 
-def select_search_region(sample_img_path: Path) -> float:
+def select_search_region(sample_img_path: Path) -> tuple | None:
     """
-    Mostra uma rotação de exemplo e permite ajustar (scroll do mouse) um
-    quadrado centrado que define a região onde o sistema vai procurar o
-    dado. Retorna a fração (0.1 a 1.0) escolhida.
+    Mostra uma rotação de exemplo e permite posicionar e redimensionar
+    um retângulo que define onde o sistema vai procurar o dado.
+
+    Retorna (x1, y1, x2, y2) em pixels da imagem de rotação,
+    ou None se pulado (sem filtro).
 
     Controles:
-      Scroll        → aumentar/diminuir o quadrado
+      Arrastar      → mover a região
+      Scroll        → redimensionar
       ENTER / C     → confirmar
-      Q             → cancelar (usa 1.0 = sem filtro)
+      Q             → pular (sem filtro para este tipo/posição)
     """
     img = cv2.imread(str(sample_img_path))
     if img is None:
-        return 1.0
+        return None
 
     size = img.shape[0]
-    sel = _CenterSquareSelector(size)
-    win = "Selecionar regiao de busca do dado"
+    sel  = _RectSelector(size, init_frac=0.45)
+    win  = "Selecionar regiao de busca do dado"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win, sel.mouse_cb)
 
     print("\n" + "="*58)
     print("  REGIÃO DE BUSCA DO DADO")
     print("="*58)
-    print("  Ajuste o quadrado central para cobrir a área onde o dado")
-    print("  fica posicionado (evita confundir com os cantos do tray).")
-    print("  SCROLL = redimensionar   ENTER = confirmar   Q = pular\n")
+    print("  Posicione o retângulo sobre o dado.")
+    print("  ARRASTAR = mover   SCROLL = redimensionar")
+    print("  ENTER = confirmar   Q = pular (sem filtro)\n")
 
-    result = 1.0
+    result = None
     while True:
         display = img.copy()
         x1, y1, x2, y2 = sel.rect
@@ -239,19 +281,21 @@ def select_search_region(sample_img_path: Path) -> float:
         display = np.where(np.stack([mask]*3, axis=2) > 0, display, dark)
         cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
 
+        side = x2 - x1
         cv2.rectangle(display, (0, 0), (size, 34), (0, 0, 0), -1)
         cv2.putText(display,
-                    f"Regiao: {sel.frac*100:.0f}%  SCROLL=ajustar  ENTER=ok  Q=pular",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+                    f"Regiao: {side}x{side}px em ({x1},{y1})  "
+                    f"ARRASTAR=mover  SCROLL=zoom  ENTER=ok  Q=pular",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1)
 
         cv2.imshow(win, display)
         key = cv2.waitKey(20) & 0xFF
 
         if key in (13, ord("c")):
-            result = sel.frac
+            result = sel.rect
             break
         elif key == ord("q"):
-            result = 1.0
+            result = None
             break
 
     cv2.destroyAllWindows()
@@ -388,45 +432,72 @@ def run_pipeline(images: list, class_map: dict, model, roi):
     print(f"  [i] Detecção automática roda em CADA rotação "
           f"(padrão de referência).\n")
 
-    # ── Calibração da região de busca POR TIPO DE DADO ──────────────────────
-    # Uma calibração para cada prefixo (d6, d8, d10, d12, d20), usando a
-    # primeira foto encontrada de cada tipo como exemplo.
-    search_fracs = {}
-    seen_types = set()
+    # ── Calibração da região de busca POR TIPO + POSIÇÃO ─────────────────────
+    # Chave: (dtype, sufixo)  ex: ("d10", ""), ("d10", "_a"), ("d6", "_b") ...
+    # Usa a primeira foto encontrada de cada combinação como exemplo.
+    search_fracs = {}   # (dtype, suffix) → float
+    seen_keys = set()
+
     for img_path_i, _ in images:
-        dtype = img_path_i.stem.split("_")[0]
-        if dtype in seen_types:
+        stem  = img_path_i.stem          # ex: "d10_2_a"
+        parts = stem.split("_")
+        dtype = parts[0]                 # "d10"
+        # sufixo de posição: tudo depois de dtype_face
+        # stem = dtype_face[_suffix]  → suffix = "_a", "_b", ... ou ""
+        # parts[0]=dtype, parts[1]=face, parts[2:]=sufixo (pode ser vazio)
+        pos_suffix = ("_" + "_".join(parts[2:])) if len(parts) > 2 else ""
+        key = (dtype, pos_suffix)
+
+        if key in seen_keys:
             continue
-        seen_types.add(dtype)
+        seen_keys.add(key)
 
         img0 = cv2.imread(str(img_path_i))
         if img0 is None:
-            search_fracs[dtype] = 1.0
+            search_fracs[key] = 1.0
             continue
 
         cropped0 = octagon_to_square_oversized(img0, roi) if roi else img0
-        tmp0 = WORK_DIR / "cropped" / f"_calib_{dtype}.jpg"
+        calib_id = f"_calib_{dtype}{pos_suffix}"
+        tmp0 = WORK_DIR / "cropped" / f"{calib_id}.jpg"
         tmp0.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(tmp0), cropped0, [cv2.IMWRITE_JPEG_QUALITY, 97])
-        rot0 = generate_rotations(tmp0, WORK_DIR / f"_calib_rot_{dtype}", n_rotations=1)
+        rot0, _ = generate_rotations(tmp0, WORK_DIR / f"_calib_rot{calib_id}", n_rotations=1)
+
+        pos_label = {
+            "":   "CENTRO",
+            "_a": "NO",
+            "_b": "NE",
+            "_c": "SO",
+            "_d": "SE",
+        }.get(pos_suffix, pos_suffix)
 
         if rot0:
-            print(f"  Calibrando região de busca para {dtype.upper()}...")
-            search_fracs[dtype] = select_search_region(rot0[0])
+            print(f"  Calibrando região de busca para {dtype.upper()} — {pos_label}...")
+            search_fracs[key] = select_search_region(rot0[0])
         else:
-            search_fracs[dtype] = 1.0
+            search_fracs[key] = None
 
     print()
-    for dtype, frac in search_fracs.items():
-        print(f"  [i] {dtype.upper()}: região de busca {frac*100:.0f}% central")
+    for (dtype, suf), rect in search_fracs.items():
+        pos_label = {"": "CENTRO", "_a": "NO", "_b": "NE", "_c": "SO", "_d": "SE"}.get(suf, suf)
+        if rect:
+            x1,y1,x2,y2 = rect
+            print(f"  [i] {dtype.upper()} {pos_label}: região {x2-x1}x{y2-y1}px em ({x1},{y1})")
+        else:
+            print(f"  [i] {dtype.upper()} {pos_label}: sem filtro")
     print()
 
     for idx, (img_path, class_id) in enumerate(images, 1):
-        stem    = img_path.stem
+        stem  = img_path.stem
+        parts = stem.split("_")
+        dtype = parts[0]
+        pos_suffix = ("_" + "_".join(parts[2:])) if len(parts) > 2 else ""
+        search_rect = search_fracs.get((dtype, pos_suffix),
+                      search_fracs.get((dtype, ""), None))  # fallback para centro do mesmo tipo
+
         rot_dir = WORK_DIR / "rotations" / stem
         lbl_dir = WORK_DIR / "labels"    / stem
-        dtype   = stem.split("_")[0]
-        search_frac = search_fracs.get(dtype, 1.0)
 
         print(f"  [{idx}/{len(images)}] {stem}")
 
@@ -440,22 +511,34 @@ def run_pipeline(images: list, class_map: dict, model, roi):
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(tmp_path), cropped, [cv2.IMWRITE_JPEG_QUALITY, 97])
 
-        rotated = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
+        rotated, matrices = generate_rotations(tmp_path, rot_dir, N_ROTATIONS)
         if not rotated:
             continue
 
+        # safe_size: lado do quadrado de cada rotação
+        safe_img = cv2.imread(str(rotated[0]))
+        safe_size = safe_img.shape[0] if safe_img is not None else 640
+
         # ── Detecção automática em CADA rotação ─────────────────────────────
         det_ok = 0
-        for r in rotated:
-            bbox_px = detect_bbox_px(model, r, search_frac=search_frac)
+        for r, M in zip(rotated, matrices):
+            # Projetar search_rect para o ângulo desta rotação
+            rotated_rect = rotate_rect(search_rect, M, safe_size) \
+                           if search_rect is not None else None
+
+            bbox_px = detect_bbox_px(model, r, search_rect=rotated_rect)
             if bbox_px is not None:
                 det_ok += 1
                 write_label_from_bbox_px(r, class_id, bbox_px, lbl_dir, preview_dir, tag="OK")
             else:
                 img_r = cv2.imread(str(r))
                 h0, w0 = img_r.shape[:2]
-                m = (1 - search_frac) / 2.0
-                bbox_px = (w0*m, h0*m, w0*(1-m), h0*(1-m))
+                if rotated_rect is not None:
+                    # fallback: usar a região rotacionada calibrada
+                    bbox_px = tuple(float(v) for v in rotated_rect)
+                else:
+                    # sem calibração: caixa central de 40%
+                    bbox_px = (w0*0.30, h0*0.30, w0*0.70, h0*0.70)
                 write_label_from_bbox_px(r, class_id, bbox_px, lbl_dir, preview_dir, tag="FALLBACK")
 
         fallback_n = len(rotated) - det_ok
@@ -487,89 +570,196 @@ def run_pipeline(images: list, class_map: dict, model, roi):
             print(f"    {l}")
         print(f"  Verifique previews em {preview_dir}")
 
+    # ── Relatório de bboxes por tamanho (menor → maior) ───────────────────────
+    # Lê todos os .txt gerados e calcula a área relativa de cada bbox.
+    # Útil para identificar bboxes anormalmente pequenas (detecção errada)
+    # e removê-las manualmente antes de treinar.
+    print(f"\n  {'─'*56}")
+    print(f"  RELATÓRIO DE BBOXES — ordenadas por tamanho (menor→maior)")
+    print(f"  {'─'*56}")
+    print(f"  {'Face':<20} {'Rotações':<10} {'Área média':>10}  {'Menor':>8}  {'Maior':>8}")
+    print(f"  {'─'*56}")
+
+    face_stats = []
+    lbl_base = WORK_DIR / "labels"
+    for face_lbl_dir in sorted(lbl_base.iterdir()):
+        if not face_lbl_dir.is_dir():
+            continue
+        areas = []
+        for txt in face_lbl_dir.glob("*.txt"):
+            try:
+                line = txt.read_text().strip().split()
+                if len(line) >= 5:
+                    bw, bh = float(line[3]), float(line[4])
+                    areas.append(bw * bh)
+            except Exception:
+                pass
+        if areas:
+            face_stats.append((
+                face_lbl_dir.name,
+                len(areas),
+                sum(areas)/len(areas),
+                min(areas),
+                max(areas),
+            ))
+
+    # Ordenar por área média (menor primeiro)
+    face_stats.sort(key=lambda x: x[2])
+
+    for name, n, avg, mn, mx in face_stats:
+        flag = "  ⚠" if mn < 0.002 else ""  # sinaliza bboxes suspeitas (< 0.2% da imagem)
+        print(f"  {name:<20} {n:<10} {avg*100:>9.2f}%  {mn*100:>7.2f}%  {mx*100:>7.2f}%{flag}")
+
+    n_suspicious = sum(1 for *_, mn, _ in face_stats if mn < 0.002)
+    if n_suspicious:
+        print(f"\n  ⚠  {n_suspicious} face(s) com bboxes menores que 0.2% da imagem.")
+        print(f"     Verifique os previews em: {preview_dir}")
+        print(f"     Para remover labels inválidos: delete o .txt e o .jpg correspondentes")
+        print(f"     em dataset/images/train/ e dataset/labels/train/")
+
     print(f"\n  Próximo passo: python dataset_collector/validate_dataset.py\n")
 
 
 
 # ─── Webcam capture ────────────────────────────────────────────────────────────
 
-def webcam_capture_one(dice_type: str, face: int, camera_index: int, roi) -> Path | None:
+# Posições de captura dentro do octógono, como fração da bbox (fx, fy)
+# Cada posição tem: chave do arquivo, label para display, fração x, fração y, cor BGR do crosshair
+CAPTURE_POSITIONS = [
+    ("",   "CENTRO",   0.50, 0.50, (0,   0,   255)),  # vermelho
+    ("_a", "NO",       0.27, 0.27, (0,   200, 255)),  # amarelo
+    ("_b", "NE",       0.73, 0.27, (0,   200, 255)),
+    ("_c", "SO",       0.27, 0.73, (0,   200, 255)),
+    ("_d", "SE",       0.73, 0.73, (0,   200, 255)),
+]
+
+
+def _roi_target_point(roi, fx: float, fy: float):
+    """Calcula um ponto dentro do octógono a (fx, fy) da bbox."""
+    xs = [p[0] for p in roi]
+    ys = [p[1] for p in roi]
+    x = int(min(xs) + (max(xs) - min(xs)) * fx)
+    y = int(min(ys) + (max(ys) - min(ys)) * fy)
+    return x, y
+
+
+def _draw_crosshair(display, cx, cy, color, size=22, thickness=2):
+    """Desenha crosshair (cruz + círculo) na posição alvo."""
+    cv2.line(display, (cx - size, cy), (cx + size, cy), color, thickness)
+    cv2.line(display, (cx, cy - size), (cx, cy + size), color, thickness)
+    cv2.circle(display, (cx, cy), 6, color, -1)
+    cv2.circle(display, (cx, cy), size + 4, color, 1)
+
+
+def webcam_capture_face(dice_type: str, face: int, camera_index: int, roi) -> list[Path]:
+    """
+    Captura 5 fotos de uma face:
+      - foto central  →  d6_1.jpg
+      - canto NO      →  d6_1_a.jpg
+      - canto NE      →  d6_1_b.jpg
+      - canto SO      →  d6_1_c.jpg
+      - canto SE      →  d6_1_d.jpg
+
+    Para cada posição, exibe na tela um crosshair indicando onde posicionar o dado.
+    Controles: ESPAÇO = capturar  |  Q = pular esta posição  |  ESC = cancelar face inteira
+    """
     cap = cv2.VideoCapture(camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     if not cap.isOpened():
         print(f"[ERRO] Câmera {camera_index} não disponível.")
-        return None
+        return []
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     face_str = str(face)
-    saved    = None
+    saved_paths = []
+
     cv2.namedWindow("Captura", cv2.WINDOW_NORMAL)
 
-    print(f"\n  {dice_type.upper()} — face {face_str}")
-    print("  ESPAÇO = capturar   Q = pular\n")
+    for suffix, pos_label, fx, fy, cross_color in CAPTURE_POSITIONS:
+        fname    = f"{dice_type}_{face_str}{suffix}.jpg"
+        out_path = INPUT_DIR / fname
 
-    while saved is None:
-        ret, frame = cap.read()
-        if not ret:
+        # Pular se já existe
+        if out_path.exists():
+            print(f"  [✓] {fname} já existe — pulando")
+            saved_paths.append(out_path)
             continue
 
-        display = frame.copy()
-        h, w = display.shape[:2]
+        pos_num  = len(saved_paths) + 1
+        print(f"\n  {dice_type.upper()} face {face_str}  [{pos_num}/5]  → posicione o dado no {pos_label}")
 
-        if roi:
-            pts = np.array(roi, dtype=np.int32)
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(mask, [pts], 255)
-            dark = (display * 0.4).astype(np.uint8)
-            display = np.where(np.stack([mask]*3, axis=2) > 0, display, dark)
-            cv2.polylines(display, [pts], isClosed=True, color=(0, 220, 80), thickness=2)
+        captured = False
+        skipped  = False
 
-            # Cruz no centro do octógono — posição ideal para o dado
-            xs = [p[0] for p in roi]
-            ys = [p[1] for p in roi]
-            roi_cx = int((min(xs) + max(xs)) / 2)
-            roi_cy = int((min(ys) + max(ys)) / 2)
-            cross_len = max(12, (max(xs) - min(xs)) // 12)
-        else:
-            roi_cx, roi_cy = w // 2, h // 2
-            cross_len = max(12, min(w, h) // 24)
+        while not captured and not skipped:
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-        # Desenhar cruz central (posição ideal para o dado)
-        cv2.line(display, (roi_cx - cross_len, roi_cy), (roi_cx + cross_len, roi_cy),
-                 (0, 0, 255), 2)
-        cv2.line(display, (roi_cx, roi_cy - cross_len), (roi_cx, roi_cy + cross_len),
-                 (0, 0, 255), 2)
-        cv2.circle(display, (roi_cx, roi_cy), 4, (0, 0, 255), -1)
+            display = frame.copy()
+            h, w = display.shape[:2]
 
-        cv2.rectangle(display, (0, 0), (w, 36), (0, 0, 0), -1)
-        cv2.putText(display,
-                    f"{dice_type.upper()} face {face_str}  ESPACO=capturar  Q=pular",
-                    (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1)
-
-        cv2.imshow("Captura", display)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord(" "):
-            fname = f"{dice_type}_{face_str}.jpg"
-            path  = INPUT_DIR / fname
-            cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            saved = path
-            flash = frame.copy()
+            # Overlay do octógono
             if roi:
                 pts = np.array(roi, dtype=np.int32)
-                cv2.polylines(flash, [pts], isClosed=True, color=(60,220,60), thickness=4)
-            cv2.putText(flash, "SALVO!", (w//2-80, h//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (60,220,60), 3)
-            cv2.imshow("Captura", flash)
-            cv2.waitKey(400)
+                mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(mask, [pts], 255)
+                dark = (display * 0.4).astype(np.uint8)
+                display = np.where(np.stack([mask]*3, axis=2) > 0, display, dark)
+                cv2.polylines(display, [pts], isClosed=True, color=(0, 220, 80), thickness=2)
+                tx, ty = _roi_target_point(roi, fx, fy)
+            else:
+                xs = [0, w]; ys = [0, h]
+                tx = int(w * fx)
+                ty = int(h * fy)
 
-        elif key == ord("q"):
-            break
+            # Crosshair na posição alvo
+            _draw_crosshair(display, tx, ty, cross_color)
+
+            # Label da posição
+            cv2.putText(display, pos_label, (tx + 16, ty - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, cross_color, 2)
+
+            # HUD top
+            cv2.rectangle(display, (0, 0), (w, 36), (0, 0, 0), -1)
+            cv2.putText(display,
+                        f"{dice_type.upper()} face {face_str}  [{pos_num}/5: {pos_label}]"
+                        f"  ESPACO=capturar  Q=pular  ESC=cancelar face",
+                        (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
+
+            cv2.imshow("Captura", display)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord(" "):
+                cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                saved_paths.append(out_path)
+                # Flash de confirmação
+                flash = frame.copy()
+                if roi:
+                    cv2.polylines(flash, [np.array(roi, dtype=np.int32)],
+                                  isClosed=True, color=(60, 220, 60), thickness=4)
+                cv2.putText(flash, f"SALVO! {pos_label}", (w//2 - 120, h//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.8, (60, 220, 60), 3)
+                cv2.imshow("Captura", flash)
+                cv2.waitKey(500)
+                captured = True
+                print(f"  [✓] {fname} salvo")
+
+            elif key == ord("q"):
+                skipped = True
+                print(f"  [—] {pos_label} pulado")
+
+            elif key == 27:  # ESC
+                print(f"\n  [x] Face {face_str} cancelada.")
+                cap.release()
+                cv2.destroyAllWindows()
+                return saved_paths
 
     cap.release()
     cv2.destroyAllWindows()
-    return saved
+    return saved_paths
+
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────────
@@ -645,22 +835,23 @@ def main():
 
     # ── Modo face específica ─────────────────────────────────────────────────
     if args.dice and args.face is not None:
-        photo = webcam_capture_one(args.dice, args.face, args.camera, roi)
-        if not photo:
+        photos = webcam_capture_face(args.dice, args.face, args.camera, roi)
+        if not photos:
             return
         key = f"{args.dice}_{args.face}"
         cid = class_map.get(key)
         if cid is None:
             print(f"[ERRO] Classe '{key}' não encontrada.")
             return
-        run_pipeline([(photo, cid)], class_map, model, roi)
+        run_pipeline([(p, cid) for p in photos], class_map, model, roi)
         return
 
     # ── Modo interativo completo ─────────────────────────────────────────────
     print("\n" + "="*58)
     print("  RPG DICE AUTO COLLECT v3")
     print("="*58)
-    print(f"  1 foto por face → {N_ROTATIONS} rotações automáticas\n")
+    print(f"  5 fotos por face (centro + NO + NE + SO + SE)")
+    print(f"  → {N_ROTATIONS} rotações automáticas por foto\n")
 
     images = []
     for dice_type, faces in DICE_FACES.items():
@@ -675,15 +866,23 @@ def main():
             if cid is None:
                 continue
 
-            existing = INPUT_DIR / f"{dice_type}_{face}.jpg"
-            if existing.exists():
-                print(f"  [✓] {key} já existe — pulando")
-                images.append((existing, cid))
+            # Verificar quais das 5 fotos já existem
+            existing = []
+            for suffix, _, _, _, _ in CAPTURE_POSITIONS:
+                p = INPUT_DIR / f"{dice_type}_{face}{suffix}.jpg"
+                if p.exists():
+                    existing.append(p)
+
+            if len(existing) == len(CAPTURE_POSITIONS):
+                print(f"  [✓] {key} — todas as {len(CAPTURE_POSITIONS)} fotos já existem")
+                for p in existing:
+                    images.append((p, cid))
                 continue
 
-            photo = webcam_capture_one(dice_type, face, args.camera, roi)
-            if photo:
-                images.append((photo, cid))
+            # Capturar as fotos que ainda faltam
+            photos = webcam_capture_face(dice_type, face, args.camera, roi)
+            for p in photos:
+                images.append((p, cid))
 
     if not images:
         print("\n[INFO] Nenhuma imagem capturada.")

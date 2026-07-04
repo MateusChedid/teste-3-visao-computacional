@@ -10,7 +10,7 @@ venv/
 *.pt
 
 # Exceto o modelo final
-!best.pt
+#!best.pt
 
 # Pesos YOLO baixados da Ultralytics
 yolov8*.pt
